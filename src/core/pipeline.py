@@ -1101,10 +1101,15 @@ class StockAnalysisPipeline:
         if realtime_quote and trend_result and trend_result.ma5 > 0:
             price = getattr(realtime_quote, 'price', None)
             if price is not None and price > 0:
+                orig_today = enhanced.get('today') or {}
+                # Issue #234 修正：today 被盘中实时 bar 覆盖后，yesterday 应为
+                # 原 today（最后一条已收盘日线）；否则昨收会错一位（周四价当昨收），
+                # 涨跌额/涨跌幅、price_change_ratio 与量比全部跟着错。
+                if isinstance(orig_today, dict) and orig_today.get('close'):
+                    enhanced['yesterday'] = orig_today
                 yesterday_close = None
                 if enhanced.get('yesterday') and isinstance(enhanced['yesterday'], dict):
                     yesterday_close = enhanced['yesterday'].get('close')
-                orig_today = enhanced.get('today') or {}
                 market_today = get_market_now(
                     get_market_for_stock(normalize_stock_code(enhanced.get('code', '')))
                 ).date().isoformat()

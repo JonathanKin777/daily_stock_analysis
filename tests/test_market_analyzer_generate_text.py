@@ -3256,6 +3256,74 @@ class TestMarketAnalyzerBypassFix:
         assert isinstance(result, str) and len(result) > 0
         ma.analyzer.generate_text_with_metadata.assert_called_once()
 
+    def test_template_review_us_always_includes_sections_three_and_four(self):
+        """模板兜底时美股（无板块榜/市场宽度数据）也应输出三、四节占位，不静默缺节。"""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from src.analyzer import GeminiAnalyzer
+        from src.core.market_profile import US_PROFILE
+        from src.core.market_strategy import get_market_strategy_blueprint
+        from src.market_analyzer import MarketAnalyzer, MarketIndex, MarketOverview
+
+        with patch("src.analyzer.get_config") as mock_cfg, patch(
+            "src.market_analyzer.get_config"
+        ) as mock_cfg2:
+            cfg = MagicMock()
+            cfg.litellm_model = "gemini/gemini-2.0-flash"
+            cfg.litellm_fallback_models = []
+            cfg.gemini_api_keys = ["<redacted>"]
+            cfg.anthropic_api_keys = []
+            cfg.openai_api_keys = []
+            cfg.deepseek_api_keys = []
+            cfg.llm_model_list = []
+            cfg.openai_base_url = None
+            cfg.market_review_region = "us"
+            cfg.market_review_color_scheme = "green_up"
+            cfg.report_language = "zh"
+            cfg.generation_backend = "litellm"
+            cfg.generation_fallback_backend = "litellm"
+            mock_cfg.return_value = cfg
+            mock_cfg2.return_value = cfg
+
+            analyzer = GeminiAnalyzer.__new__(GeminiAnalyzer)
+            analyzer._router = None
+            analyzer._litellm_available = True
+            analyzer._config_override = cfg
+            analyzer.get_generation_backend_identity = MagicMock(
+                return_value=("litellm", cfg.litellm_model)
+            )
+            analyzer.generate_text_with_metadata = MagicMock(return_value=None)
+
+            ma = MarketAnalyzer.__new__(MarketAnalyzer)
+            ma.analyzer = analyzer
+            ma.config = cfg
+            ma.profile = US_PROFILE
+            ma.strategy = get_market_strategy_blueprint("us")
+            ma.region = "us"
+
+            overview = MarketOverview(
+                date="2026-11-09",
+                indices=[
+                    MarketIndex(
+                        code="SPX",
+                        name="标普500指数",
+                        current=7568.30,
+                        change=192.0,
+                        change_pct=2.60,
+                    )
+                ],
+            )
+            report = ma._generate_template_review(overview, [])
+            assert "### 三、板块主线" in report
+            assert "### 四、资金与情绪" in report
+            assert "### 五、消息催化" in report
+            assert (
+                report.index("### 三、")
+                < report.index("### 四、")
+                < report.index("### 五、")
+            )
+
     def test_generation_backend_config_error_does_not_template_fallback(self):
         from src.llm.generation_backend import GenerationError
         from src.market_analyzer import MarketOverview, MarketIndex

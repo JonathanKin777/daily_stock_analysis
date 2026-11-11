@@ -1940,17 +1940,15 @@ Output the report content directly, no extra commentary.
         bottom_concept_text = separator.join([s['name'] for s in overview.bottom_concepts[:3]])
 
         if template_language == "en":
-            stats_section = ""
+            # 模板兜底时 3、4 节始终输出：无数据时写占位说明，不静默缺节。
+            stats_block = ""
             if self._supports_market_light() or self.profile.has_market_stats:
                 stats_block = self._build_stats_block(overview)
-                if stats_block:
-                    stats_section = f"""
+            stats_section = f"""
 ### 3. Breadth & Liquidity
-{stats_block}
+{stats_block or "- No market breadth data available."}
 """
-            sector_section = ""
-            if self.profile.has_sector_rankings and (top_text or bottom_text or top_concept_text or bottom_concept_text):
-                sector_section = f"""
+            sector_section = f"""
 ### 4. Sector / Theme Highlights
 - **Industry Leaders**: {top_text or "N/A"}
 - **Industry Laggards**: {bottom_text or "N/A"}
@@ -2006,21 +2004,22 @@ Market conditions can change quickly. The data above is for reference only and d
                 else "- 当前以主要指数与可用新闻线索评估整体风险状态。"
             )
         )
-        sector_section = (
-            f"""
+        # 模板兜底时三、四节始终输出：无数据时写占位说明，不静默缺节
+        #（否则报告会从二直接跳到五）。
+        sector_section = f"""
 ### 三、板块主线
 {sector_block or "- 暂无板块涨跌榜数据。"}
 """
-            if self.profile.has_sector_rankings
-            else ""
-        )
         funds_section = (
             """
 ### 四、资金与情绪
 - 结合成交额和涨跌家数看，当前更适合等待确认，避免仅凭单一热点追高。
 """
             if self.profile.has_market_stats
-            else ""
+            else """
+### 四、资金与情绪
+- 暂无资金与情绪数据（当前市场不提供市场宽度数据）。
+"""
         )
         return f"""## {overview.date} 大盘复盘
 

@@ -202,7 +202,8 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         context = {
             "code": "600519",
             "date": (today - timedelta(days=1)).isoformat(),
-            "today": {"close": 15.0, "ma5": 14.8, "ma10": 14.5},
+            # 真实日线总带成交量；yesterday 被修正为原 today 后，量比按原 today 的量算
+            "today": {"close": 15.0, "ma5": 14.8, "ma10": 14.5, "volume": 1000000},
             "yesterday": {"close": 14.5, "volume": 1000000},
         }
         quote = _make_realtime_quote(price=15.72, volume=2000000)
@@ -227,6 +228,40 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["today"]["realtime_source"], "tencent")
         self.assertIn("price_change_ratio", enhanced)
         self.assertIn("volume_change_ratio", enhanced)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_realtime_override_moves_yesterday_to_last_closed_bar(
+        self, _mock_market, mock_now
+    ) -> None:
+        """Issue #234 修正：today 被盘中实时 bar 覆盖后，yesterday 应为原 today
+        （最后一条已收盘日线），否则昨收会错一位（周四价当昨收）。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context = {
+            "code": "QQQM",
+            "date": (today - timedelta(days=1)).isoformat(),
+            # 原 today：周五已收盘日线；原 yesterday：周四
+            "today": {"close": 270.22, "ma5": 276.91, "ma10": 283.96},
+            "yesterday": {"close": 266.85, "volume": 1000000},
+        }
+        quote = _make_realtime_quote(price=280.33, volume=2000000)
+        trend = TrendAnalysisResult(
+            code="QQQM",
+            trend_status=TrendStatus.BULL,
+            ma5=276.91,
+            ma10=283.96,
+            ma20=290.07,
+        )
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "Invesco NASDAQ 100 ETF"
+        )
+        # yesterday 应为原 today（周五收盘 270.22），不是周四 266.85
+        self.assertEqual(enhanced["yesterday"]["close"], 270.22)
+        # 涨跌幅按周五收盘算：(280.33-270.22)/270.22 = 3.74%
+        self.assertEqual(enhanced["price_change_ratio"], 3.74)
 
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")

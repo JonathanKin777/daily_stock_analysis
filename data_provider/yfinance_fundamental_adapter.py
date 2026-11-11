@@ -142,6 +142,11 @@ def _convert_to_yf_symbol(stock_code: str) -> str:
         digits = code[2:].lstrip("0") or "0"
         return f"{digits.zfill(4)}.HK"
     if "." in code:
+        # 美股点号类代码 Yahoo 要求连字符（BRK.B -> BRK-B）；港股/日韩台
+        # 后缀（.HK/.T/.TW 等）保持原样。
+        head, _, tail = code.partition(".")
+        if head.isalpha() and len(head) <= 5 and len(tail) == 1 and tail.isalpha():
+            return f"{head}-{tail}"
         return code
     # Assume US ticker by default for non-HK / non-CN callers
     return code

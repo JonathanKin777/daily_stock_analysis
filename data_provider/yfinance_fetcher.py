@@ -126,10 +126,12 @@ class YfinanceFetcher(BaseFetcher):
             logger.debug(f"识别为美股指数: {code} -> {yf_symbol}")
             return yf_symbol
 
-        # 美股：1-5 个大写字母（可选 .X 后缀），原样返回
+        # 美股：1-5 个大写字母（可选 .X 后缀）；Yahoo 要求点号类代码用连字符
+        #（BRK.B -> BRK-B），否则 Yahoo 返回 404（提示可能已退市）。
         if is_us_stock_code(code):
-            logger.debug(f"识别为美股代码: {code}")
-            return code
+            yahoo_code = code.replace(".", "-")
+            logger.debug(f"识别为美股代码: {code} -> {yahoo_code}")
+            return yahoo_code
 
         # 日股/韩股/台股 MVP：显式 Yahoo Finance suffix-only 代码，原样传给 Yahoo。
         if self._is_jp_kr_suffix_stock(code) or self._is_tw_suffix_stock(code):
@@ -542,7 +544,8 @@ class YfinanceFetcher(BaseFetcher):
         被限流时，至少能为 Web UI 提供可用价格；若可获取到昨收价，则同时提供涨跌幅等衍生指标。
         """
         symbol = stock_code.strip().upper()
-        stooq_symbol = f"{symbol.lower()}.us"
+        # Stooq 也要求点号类代码用连字符（BRK.B -> brk-b.us）
+        stooq_symbol = f"{symbol.lower().replace('.', '-')}.us"
         url = f"https://stooq.com/q/l/?s={stooq_symbol}"
         request = Request(
             url,
