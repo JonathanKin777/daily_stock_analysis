@@ -1102,17 +1102,38 @@ class StockAnalysisPipeline:
             price = getattr(realtime_quote, 'price', None)
             if price is not None and price > 0:
                 orig_today = enhanced.get('today') or {}
-                # Issue #234 修正：today 被盘中实时 bar 覆盖后，yesterday 应为
-                # 原 today（最后一条已收盘日线）；否则昨收会错一位（周四价当昨收），
-                # 涨跌额/涨跌幅、price_change_ratio 与量比全部跟着错。
-                if isinstance(orig_today, dict) and orig_today.get('close'):
+                market_today = get_market_now(
+                    get_market_for_stock(normalize_stock_code(enhanced.get('code', '')))
+                ).date().isoformat()
+                # Issue #234 修正（v2，2026-11-11 试跑复盘）：yesterday 只能在实时
+                # 行情确实代表新一个交易日时才移为原 today。日线只含已收盘
+                # bar，原 today 是最后一条已收盘日线：盘中运行时它一般是
+                # 上一收盘日（周五），实时价是新交易日（周一）盘中价，移位
+                # 才对；但盘后/盘前运行时原 today 已是当日收盘日线（11-11
+                # 试跑：原 today 即 11-10 收盘 277.87），实时价只是同一收盘
+                # 价，无条件移位会把昨收写成当天收盘（昨收=收盘、涨跌额 0）。
+                # 因此两个条件缺一不可：①原 today 日期早于今日（日线滞后
+                # 于今日）；②市场不在盘后/盘前（is_partial_bar 不为 False，
+                # 盘前实时价只是上一收盘价、同样不能移）。当日线已含今日
+                # partial bar（日期等于今日）时 yesterday 本来就是上一收盘
+                # 日，也不移位；日期或 phase 信息缺失时沿用旧行为（兼容直
+                # 接调用与既有单测）。
+                is_partial_bar = None
+                if isinstance(market_phase_context, dict):
+                    is_partial_bar = market_phase_context.get("is_partial_bar")
+                orig_date = (
+                    orig_today.get("date") if isinstance(orig_today, dict) else None
+                )
+                if (
+                    (orig_date is None or str(orig_date) != market_today)
+                    and is_partial_bar is not False
+                    and isinstance(orig_today, dict)
+                    and orig_today.get('close')
+                ):
                     enhanced['yesterday'] = orig_today
                 yesterday_close = None
                 if enhanced.get('yesterday') and isinstance(enhanced['yesterday'], dict):
                     yesterday_close = enhanced['yesterday'].get('close')
-                market_today = get_market_now(
-                    get_market_for_stock(normalize_stock_code(enhanced.get('code', '')))
-                ).date().isoformat()
                 source = getattr(realtime_quote, 'source', None)
                 source_name = getattr(source, 'value', source)
                 source_name = str(source_name) if source_name is not None else 'unknown'
@@ -1186,6 +1207,13 @@ class StockAnalysisPipeline:
                             enhanced['price_change_ratio'] = round(
                                 (price - yc) / yc * 100, 2
                             )
+                            # 涨跌幅与涨跌额用同一昨收算：quote 自带的 change_pct
+                            # 可能来自另一口径的前收（11-11 试跑：quote 给 -0.76%，
+                            # 按真实前收应为 -0.59%），覆盖为按 yesterday_close
+                            # 算出的值，保证报告表内涨跌幅与涨跌额自洽。
+                            realtime_today['pct_chg'] = enhanced['price_change_ratio']
+                            if 'pct_chg' not in realtime_today.get('estimated_fields', []):
+                                realtime_today.setdefault('estimated_fields', []).append('pct_chg')
                     except (TypeError, ValueError):
                         pass
                 if vol is not None and enhanced.get('yesterday'):

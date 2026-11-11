@@ -256,12 +256,167 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
             ma20=290.07,
         )
         enhanced = self.pipeline._enhance_context(
-            context, quote, None, trend, "Invesco NASDAQ 100 ETF"
+            context, quote, None, trend, "Invesco NASDAQ 100 ETF",
+            market_phase_context={"is_partial_bar": True},
         )
         # yesterday 应为原 today（周五收盘 270.22），不是周四 266.85
         self.assertEqual(enhanced["yesterday"]["close"], 270.22)
         # 涨跌幅按周五收盘算：(280.33-270.22)/270.22 = 3.74%
         self.assertEqual(enhanced["price_change_ratio"], 3.74)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_realtime_override_keeps_yesterday_when_not_partial_bar(
+        self, _mock_market, mock_now
+    ) -> None:
+        """Issue #234 修正 v2（2026-11-11 试跑回归）：盘后/盘前运行时原 today
+        已是当日收盘日线，实时价只是同一收盘价，yesterday 不能再移为原
+        today，否则昨收=收盘、涨跌额 0。QQQM 11-10 收盘 277.87，11-09
+        收盘 279.52，quote 自带的 change_pct（-0.76%）与真实前收不符，
+        today 的 pct_chg 应按 yesterday 重算为 -0.59%。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context = {
+            "code": "QQQM",
+            "date": (today - timedelta(days=1)).isoformat(),
+            # 原 today：11-10 已收盘日线；原 yesterday：11-09 收盘
+            "today": {"close": 277.87, "ma5": 275.88, "ma10": 281.97, "volume": 3430000},
+            "yesterday": {"close": 279.52, "volume": 3400000},
+        }
+        quote = _make_realtime_quote(
+            price=277.87, volume=3430000, change_pct=-0.76
+        )
+        trend = TrendAnalysisResult(
+            code="QQQM",
+            trend_status=TrendStatus.BEAR,
+            ma5=275.88,
+            ma10=281.97,
+            ma20=288.61,
+        )
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "Invesco NASDAQ 100 ETF",
+            market_phase_context={"is_partial_bar": False},
+        )
+        # yesterday 保持 11-09 收盘 279.52，不是 11-10 的 277.87
+        self.assertEqual(enhanced["yesterday"]["close"], 279.52)
+        # 涨跌幅按 11-09 收盘算：(277.87-279.52)/279.52 = -0.59%
+        self.assertEqual(enhanced["price_change_ratio"], -0.59)
+        # today 的 pct_chg 与 price_change_ratio 同口径，不再用 quote 的 -0.76%
+        self.assertEqual(enhanced["today"]["pct_chg"], -0.59)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_realtime_override_moves_yesterday_without_phase_context(
+        self, _mock_market, mock_now
+    ) -> None:
+        """phase 信息缺失时沿用旧行为（盘中移位），兼容直接调用。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context = {
+            "code": "QQQM",
+            "date": (today - timedelta(days=1)).isoformat(),
+            "today": {"close": 270.22, "ma5": 276.91, "ma10": 283.96},
+            "yesterday": {"close": 266.85, "volume": 1000000},
+        }
+        quote = _make_realtime_quote(price=280.33, volume=2000000)
+        trend = TrendAnalysisResult(
+            code="QQQM",
+            trend_status=TrendStatus.BULL,
+            ma5=276.91,
+            ma10=283.96,
+            ma20=290.07,
+        )
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "Invesco NASDAQ 100 ETF"
+        )
+        self.assertEqual(enhanced["yesterday"]["close"], 270.22)
+        self.assertEqual(enhanced["price_change_ratio"], 3.74)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_realtime_override_keeps_yesterday_when_today_bar_already_dated_today(
+        self, _mock_market, mock_now
+    ) -> None:
+        """Issue #234 修正 v2 自检：如果日线已含今日 partial bar（原 today
+        日期等于今日），yesterday 本来就是上一收盘日，即使盘中也不移位，
+        否则昨收会被写成当日盘中价。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context = {
+            "code": "QQQM",
+            "date": today.isoformat(),
+            "today": {
+                "close": 277.87,
+                "date": today.isoformat(),
+                "ma5": 275.88,
+                "ma10": 281.97,
+                "volume": 3430000,
+            },
+            "yesterday": {"close": 279.52, "volume": 3400000},
+        }
+        quote = _make_realtime_quote(price=278.50, volume=3500000, change_pct=-0.36)
+        trend = TrendAnalysisResult(
+            code="QQQM",
+            trend_status=TrendStatus.BEAR,
+            ma5=275.88,
+            ma10=281.97,
+            ma20=288.61,
+        )
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "Invesco NASDAQ 100 ETF",
+            market_phase_context={"is_partial_bar": True},
+        )
+        self.assertEqual(enhanced["yesterday"]["close"], 279.52)
+        # (278.50-279.52)/279.52 = -0.36%
+        self.assertEqual(enhanced["price_change_ratio"], -0.36)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_realtime_override_keeps_yesterday_in_premarket(
+        self, _mock_market, mock_now
+    ) -> None:
+        """Issue #234 修正 v2 自检：盘前（16:00 北京时间定时跑）原 today
+        日期早于今日、但实时价只是上一收盘价，is_partial_bar 为 False
+        否决移位；只看日期会误判。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 3, 0, tzinfo=timezone.utc
+        )
+        context = {
+            "code": "QQQM",
+            "date": (today - timedelta(days=1)).isoformat(),
+            "today": {
+                "close": 277.87,
+                "date": (today - timedelta(days=1)).isoformat(),
+                "ma5": 275.88,
+                "ma10": 281.97,
+                "volume": 3430000,
+            },
+            "yesterday": {"close": 279.52, "volume": 3400000},
+        }
+        quote = _make_realtime_quote(
+            price=277.87, volume=3430000, change_pct=-0.76
+        )
+        trend = TrendAnalysisResult(
+            code="QQQM",
+            trend_status=TrendStatus.BEAR,
+            ma5=275.88,
+            ma10=281.97,
+            ma20=288.61,
+        )
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "Invesco NASDAQ 100 ETF",
+            market_phase_context={"is_partial_bar": False},
+        )
+        self.assertEqual(enhanced["yesterday"]["close"], 279.52)
+        self.assertEqual(enhanced["price_change_ratio"], -0.59)
+        self.assertEqual(enhanced["today"]["pct_chg"], -0.59)
 
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
