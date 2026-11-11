@@ -27,7 +27,9 @@ mark the block as ``partial`` when only some fields are populated.
 """
 from __future__ import annotations
 
+import json
 import logging
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -152,6 +154,118 @@ def _convert_to_yf_symbol(stock_code: str) -> str:
     return code
 
 
+# ---------------- SEC EDGAR cross-check (US stocks) ----------------
+# Yahoo's quarterly "Total Revenue" can disagree with the filed 10-Q
+# (BRK.B 2026Q3: Yahoo $117.59B vs the filed $105.647B), while the filed
+# NetIncomeLoss matches. SEC EDGAR companyfacts is a free, keyless,
+# authoritative source for both figures, so prefer it when a matching
+# 10-Q exists. Everything here is fail-open: any lookup/fetch failure
+# returns None and callers keep the Yahoo values.
+_SEC_EDGAR_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+_SEC_EDGAR_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+_SEC_EDGAR_USER_AGENT = "daily-stock-analysis/1.0 (fundamental cross-check)"
+_SEC_EDGAR_TIMEOUT_SECONDS = 10.0
+_SEC_EDGAR_TICKER_CACHE: Dict[str, Optional[str]] = {}
+_SEC_EDGAR_FACTS_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+# Public CIKs for the tickers this deployment actually holds, consulted only
+# when the SEC ticker map (www.sec.gov) is unreachable — an egress proxy may
+# 403 that host while data.sec.gov still answers. The map stays the authority;
+# this is a fallback, not a second source of truth.
+_SEC_EDGAR_KNOWN_CIKS = {"BRK/B": "0001067983"}
+
+
+def _edgar_json(url: str, _opener=None) -> Any:
+    opener = _opener or urllib.request.urlopen
+    request = urllib.request.Request(url, headers={"User-Agent": _SEC_EDGAR_USER_AGENT})
+    with opener(request, timeout=_SEC_EDGAR_TIMEOUT_SECONDS) as response:
+        return json.load(response)
+
+
+def _resolve_sec_cik(symbol: str, _opener=None) -> Optional[str]:
+    """Resolve a Yahoo symbol to a zero-padded 10-digit SEC CIK, or None."""
+    key = (symbol or "").strip().upper()
+    if not key:
+        return None
+    if key in _SEC_EDGAR_TICKER_CACHE:
+        return _SEC_EDGAR_TICKER_CACHE[key]
+    cik: Optional[str] = None
+    try:
+        payload = _edgar_json(_SEC_EDGAR_TICKERS_URL, _opener)
+        lookup: Dict[str, str] = {}
+        for entry in payload.values():
+            ticker = str(entry.get("ticker", "")).strip().upper()
+            if ticker:
+                lookup[ticker] = str(entry.get("cik_str", "")).zfill(10)
+        # EDGAR writes share classes with a slash (BRK/B); Yahoo with a dash.
+        for candidate in (key, key.replace("-", "/")):
+            if candidate in lookup:
+                cik = lookup[candidate]
+                break
+    except Exception:
+        cik = None
+    if cik is None:
+        # Ticker-map fetch failed (or the ticker is absent): fall back to the
+        # known-CIK table above so the cross-check still works.
+        cik = _SEC_EDGAR_KNOWN_CIKS.get(key.replace("-", "/"))
+    _SEC_EDGAR_TICKER_CACHE[key] = cik
+    return cik
+
+
+def _quarter_of_iso_date(iso_date: Any) -> Optional[tuple]:
+    try:
+        parsed = datetime.strptime(str(iso_date), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    return (parsed.year, (parsed.month - 1) // 3 + 1)
+
+
+def fetch_sec_edgar_quarterly_figures(
+    symbol: str, report_date: Any, _opener=None
+) -> Optional[Dict[str, float]]:
+    """Return filed quarterly ``{"revenue": ..., "net_income": ...}`` for a US stock.
+
+    Matches the 10-Q whose period end equals ``report_date`` (the quarter-end
+    taken from Yahoo's income statement). Frame-less rows are year-to-date
+    cumulative figures and are skipped. Q4 has no standalone 10-Q (the 10-K
+    reports the full year), so Q4 always returns None and keeps Yahoo data.
+    """
+    quarter = _quarter_of_iso_date(report_date)
+    if quarter is None or quarter[1] == 4:
+        return None
+    year, q = quarter
+    cik = _resolve_sec_cik(symbol, _opener)
+    if not cik:
+        return None
+    if cik in _SEC_EDGAR_FACTS_CACHE:
+        facts = _SEC_EDGAR_FACTS_CACHE[cik]
+    else:
+        try:
+            facts = _edgar_json(_SEC_EDGAR_COMPANYFACTS_URL.format(cik=cik), _opener)
+        except Exception:
+            facts = None
+        _SEC_EDGAR_FACTS_CACHE[cik] = facts
+    if not isinstance(facts, dict):
+        return None
+    units = facts.get("facts", {}).get("us-gaap", {})
+    out: Dict[str, float] = {}
+    for concept, field in (("Revenues", "revenue"), ("NetIncomeLoss", "net_income")):
+        entries = units.get(concept, {}).get("units", {}).get("USD", [])
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("form") != "10-Q" or entry.get("end") != report_date:
+                continue
+            if entry.get("fy") != year or entry.get("fp") != f"Q{q}":
+                continue
+            if not entry.get("frame"):
+                continue
+            value = _safe_float(entry.get("val"))
+            if value is not None:
+                out[field] = value
+                break
+    return out or None
+
+
 class YfinanceFundamentalAdapter:
     """HK/US fundamental adapter backed by yfinance.
 
@@ -159,6 +273,12 @@ class YfinanceFundamentalAdapter:
     aggregation in :func:`data_provider.base.get_fundamental_context` can stay
     market-agnostic.
     """
+
+    def __init__(self, sec_edgar_fetcher=None):
+        # Optional SEC EDGAR cross-check for the quarterly figures (injected
+        # by the production wiring in data_provider.base; None keeps the
+        # adapter fully offline, which the unit tests rely on).
+        self._sec_edgar_fetcher = sec_edgar_fetcher
 
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -270,6 +390,24 @@ class YfinanceFundamentalAdapter:
             growth_payload["net_profit_yoy"] = statement_net_profit_yoy
         if any(v is not None for v in growth_payload.values()):
             result["growth"] = growth_payload
+
+        # SEC EDGAR cross-check (US stocks, Q1-Q3): prefer the filed 10-Q
+        # quarterly figures over Yahoo's statement row when they exist.
+        # Any lookup/fetch failure keeps the Yahoo values (fail-open).
+        # The fetcher is injected by the production wiring; without it the
+        # adapter stays fully offline.
+        edgar_override = None
+        if report_date is not None and self._sec_edgar_fetcher is not None:
+            try:
+                edgar_override = self._sec_edgar_fetcher(symbol, report_date)
+            except Exception:
+                edgar_override = None
+        if edgar_override:
+            if edgar_override.get("revenue") is not None:
+                revenue_latest = edgar_override["revenue"]
+            if edgar_override.get("net_income") is not None:
+                net_profit_latest = edgar_override["net_income"]
+            result["source_chain"].append("earnings.financial_report:sec-edgar")
 
         financial_report = {
             "report_date": report_date,

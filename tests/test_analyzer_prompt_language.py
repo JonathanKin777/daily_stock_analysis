@@ -22,7 +22,8 @@ except ModuleNotFoundError:
     ensure_litellm_stub()
 
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_EN, CORE_TRADING_SKILL_POLICY_ZH
-from src.analyzer import GeminiAnalyzer, _legacy_audit_marker_specs
+from src.analyzer import GeminiAnalyzer, _legacy_audit_marker_specs, normalize_dashboard_price_units
+from src.market_context import get_currency_unit
 
 # CJK ideographs plus full-width punctuation/forms. Hangul is intentionally not
 # matched so the Korean output directive does not count as Chinese template text.
@@ -257,6 +258,104 @@ class EnglishAnalyzeMessagesTestCase(unittest.TestCase):
         self.assertIn("US stock", captured["system"])
         self.assertIn("## Output Language (highest priority)", captured["system"])
         self.assertIn("### Output language requirements (highest priority)", captured["user"])
+
+
+class TestSniperPointCurrencyUnit(unittest.TestCase):
+    """Sniper-point price examples must use the market's own currency unit.
+
+    The Chinese templates used to hard-code the A-share example ``XX元``,
+    so US-stock reports wrote ``474.00元`` for SMH. The unit is now a
+    per-market placeholder (美元 for US, 港元 for HK, 元 for A-shares).
+    """
+
+    def test_chinese_prompt_uses_market_currency_for_sniper_examples(self) -> None:
+        cases = (
+            ("BRK.B", "XX美元", "XX元"),
+            ("SMH", "XX美元", "XX元"),
+            ("00700.HK", "XX港元", "XX元"),
+            ("600519", "XX元", None),
+        )
+        for legacy in (True, False):
+            analyzer = _make_analyzer(legacy=legacy)
+            for code, expected, forbidden in cases:
+                with self.subTest(legacy=legacy, code=code):
+                    prompt = analyzer._get_analysis_system_prompt("zh", stock_code=code)
+                    self.assertIn(expected, prompt)
+                    if forbidden is not None:
+                        self.assertNotIn(forbidden, prompt)
+
+    def test_english_prompt_uses_market_currency_for_sniper_examples(self) -> None:
+        for legacy in (True, False):
+            analyzer = _make_analyzer(legacy=legacy)
+            with self.subTest(legacy=legacy):
+                prompt = analyzer._get_analysis_system_prompt("en", stock_code="BRK.B")
+                self.assertIn("XX USD", prompt)
+            with self.subTest(legacy=legacy):
+                prompt = analyzer._get_analysis_system_prompt("en", stock_code="600519")
+                self.assertIn("XX CNY", prompt)
+
+    def test_get_currency_unit(self) -> None:
+        self.assertEqual(get_currency_unit("BRK.B", "zh"), "美元")
+        self.assertEqual(get_currency_unit("BRK.B", "en"), "USD")
+        self.assertEqual(get_currency_unit("00700.HK", "zh"), "港元")
+        self.assertEqual(get_currency_unit("600519", "zh"), "元")
+        self.assertEqual(get_currency_unit("", "zh"), "元")
+
+    def test_normalize_dashboard_price_units_rewrites_bare_yuan(self) -> None:
+        dashboard = {
+            "battle_plan": {
+                "sniper_points": {
+                    "ideal_buy": "理想买入点：474.03元（在MA5附近）",
+                    "secondary_buy": "次优买入点：470.00元（回踩确认）",
+                    "stop_loss": "止损位：474.00元（跌破今日低点坚决止损离场）",
+                    "take_profit": "目标位：506.57美元（反弹至MA10）",
+                }
+            }
+        }
+        normalize_dashboard_price_units(dashboard, "SMH")
+        sniper = dashboard["battle_plan"]["sniper_points"]
+        self.assertIn("474.03美元", sniper["ideal_buy"])
+        self.assertIn("470.00美元", sniper["secondary_buy"])
+        self.assertIn("474.00美元", sniper["stop_loss"])
+        # Already-correct 美元 is left alone.
+        self.assertEqual(sniper["take_profit"], "目标位：506.57美元（反弹至MA10）")
+
+    def test_normalize_dashboard_price_units_keeps_a_share_yuan(self) -> None:
+        dashboard = {
+            "battle_plan": {
+                "sniper_points": {
+                    "stop_loss": "止损位：10.50元（跌破MA20）",
+                    "take_profit": "目标位：12.00元（前高）",
+                }
+            }
+        }
+        normalize_dashboard_price_units(dashboard, "600519")
+        sniper = dashboard["battle_plan"]["sniper_points"]
+        self.assertIn("10.50元", sniper["stop_loss"])
+        self.assertIn("12.00元", sniper["take_profit"])
+
+    def test_user_prompt_price_rows_use_market_currency(self) -> None:
+        # The user prompt hands the model the same price rows (close, realtime
+        # price, chip average cost); a hard-coded 元 there feeds the same
+        # unit error, so those rows get the market unit too.
+        analyzer = _make_analyzer(legacy=False)
+        fake_cfg = SimpleNamespace(news_max_age_days=3, news_strategy_profile="short")
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            us_prompt = analyzer._format_prompt(
+                _rich_context(), "Apple", news_context="n", report_language="zh"
+            )
+            cn_context = _rich_context()
+            cn_context["code"] = "600519"
+            cn_prompt = analyzer._format_prompt(
+                cn_context, "贵州茅台", news_context="n", report_language="zh"
+            )
+
+        self.assertIn("10.5 美元", us_prompt)
+        self.assertIn("9.5 美元", us_prompt)
+        self.assertNotIn("10.5 元", us_prompt)
+        self.assertNotIn("9.5 元", us_prompt)
+        self.assertIn("10.5 元", cn_prompt)
+        self.assertIn("9.5 元", cn_prompt)
 
 
 if __name__ == "__main__":

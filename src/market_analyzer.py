@@ -35,6 +35,7 @@ from src.llm.backend_registry import (
 from src.llm.generation_backend import GenerationError, GenerationResult
 from src.schemas.market_light import MARKET_LIGHT_REGIONS, MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
+from src.services.fred_macro import fetch_us_macro_snapshot, format_macro_block
 from src.services.intelligence_service import IntelligenceService
 from data_provider.base import DataFetcherManager
 
@@ -776,14 +777,15 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         
         return all_news
     
-    def generate_market_review(self, overview: MarketOverview, news: List) -> str:
+    def generate_market_review(self, overview: MarketOverview, news: List, macro_snapshot=None) -> str:
         """
         使用大模型生成大盘复盘报告
-        
+
         Args:
             overview: 市场概览数据
             news: 市场新闻列表 (SearchResult 对象列表)
-            
+            macro_snapshot: FRED 宏观数据快照（美股 CPI/PPI，未获取时为 None）
+
         Returns:
             大盘复盘报告文本
         """
@@ -813,7 +815,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return self._generate_template_review(overview, news)
 
         # 构建 Prompt
-        prompt = self._build_review_prompt(overview, news)
+        prompt = self._build_review_prompt(overview, news, macro_snapshot=macro_snapshot)
 
         logger.info("[大盘] %s action=generate_review status=start", self._log_context())
         # Use public analyzer APIs so diagnostics reflect the actual execution backend.
@@ -1659,7 +1661,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         add_section("风险提示", "（列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）")
         return "\n\n".join(sections)
 
-    def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
+    def _build_review_prompt(self, overview: MarketOverview, news: List, macro_snapshot=None) -> str:
         """构建复盘报告 Prompt"""
         review_language = self._get_review_language()
         # Korean reuses the English structural template but the model is told to
@@ -1746,6 +1748,38 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             if not indices_text
             else ""
         )
+        # FRED 宏观数据事实块（美股 CPI/PPI）：新闻检索无渠道时仍能覆盖
+        # 关键宏观事件。为空时不注入，复盘不得据此断言无宏观事件。
+        # 仅美股复盘注入；其他市场即使误传快照也不采用。
+        macro_text = (
+            format_macro_block(macro_snapshot, review_language)
+            if self.region == "us"
+            else ""
+        )
+        if macro_text:
+            if review_language == "en":
+                empty_news_placeholder = (
+                    "No news was returned by the news search. Do not claim there "
+                    "were no major macro events; base any macro judgement only on "
+                    "the [Macro Data] facts block below."
+                )
+            else:
+                empty_news_placeholder = (
+                    "本次新闻检索未返回结果（无可用新闻）。不得据此断言无重大宏观事件；"
+                    "宏观判断仅可依据下方【宏观数据】事实块。"
+                )
+        elif review_language == "en":
+            empty_news_placeholder = (
+                "No news was returned by the news search and no macro-data "
+                "facts block is available. Do not claim there were no major "
+                "macro events."
+            )
+        else:
+            empty_news_placeholder = (
+                "本次新闻检索未返回结果（无可用新闻），且无宏观数据事实块。"
+                "本次复盘不得断言宏观事件的有无。"
+            )
+
         if review_language == "en":
             data_no_indices_hint = (
                 "Note: Market data fetch failed. Rely mainly on [Market News] for qualitative analysis. Do not invent index levels."
@@ -1753,7 +1787,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 else ""
             )
             indices_placeholder = indices_text if indices_text else "No index data (API error)"
-            news_placeholder = news_text if news_text else "No relevant news"
+            news_placeholder = news_text if news_text else empty_news_placeholder
             data_boundary_requirement = (
                 "- Respect Data Limits: do not invent or over-interpret unsupported breadth, fund-flow, turnover, participation, or sector-ranking data.\n"
                 if data_limits_block
@@ -1766,7 +1800,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             )
         else:
             indices_placeholder = indices_text if indices_text else "暂无指数数据（接口异常）"
-            news_placeholder = news_text if news_text else "暂无相关新闻"
+            news_placeholder = news_text if news_text else empty_news_placeholder
             data_boundary_requirement = (
                 "- 严格遵守数据边界：未提供涨跌家数、资金流、成交额汇总或板块榜时，不要编造或过度解读。\n"
                 if data_limits_block
@@ -1819,6 +1853,8 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
 ## Market News
 {news_placeholder}
+
+{macro_text}
 
 {data_no_indices_hint}
 
@@ -1873,6 +1909,8 @@ Output the report content directly, no extra commentary.
 
 ## 市场新闻
 {news_placeholder}
+
+{macro_text}
 
 {data_no_indices_hint}
 
@@ -2056,8 +2094,22 @@ Market conditions can change quickly. The data above is for reference only and d
         news = self.search_market_news()
         news = self._merge_persisted_market_intelligence(news)
 
+        # 2b. 美股补充宏观数据（FRED 免 key 公开数据）：新闻检索无渠道时
+        # 仍能覆盖 CPI/PPI 这类关键宏观事件。失败则不注入（fail-open）。
+        macro_snapshot = None
+        if self.region == "us":
+            try:
+                macro_snapshot = fetch_us_macro_snapshot()
+            except Exception as exc:  # noqa: BLE001 - fail-open by design
+                logger.debug(
+                    "[大盘] %s action=fetch_macro_snapshot status=failed error=%s",
+                    self._log_context(),
+                    exc,
+                )
+                macro_snapshot = None
+
         # 3. 生成复盘报告
-        report = self.generate_market_review(overview, news)
+        report = self.generate_market_review(overview, news, macro_snapshot=macro_snapshot)
         snapshot = self.build_market_light_snapshot(overview) if self._supports_market_light() else None
         structured_payload = self.build_market_review_payload(
             overview,

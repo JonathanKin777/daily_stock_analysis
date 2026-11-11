@@ -8,6 +8,7 @@ graceful degradation when yfinance is unavailable.
 """
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
@@ -16,8 +17,11 @@ import pandas as pd
 
 from data_provider.yfinance_fundamental_adapter import (
     YfinanceFundamentalAdapter,
+    _SEC_EDGAR_FACTS_CACHE,
+    _SEC_EDGAR_TICKER_CACHE,
     _convert_to_yf_symbol,
     _yoy_from_row,
+    fetch_sec_edgar_quarterly_figures,
 )
 
 
@@ -361,6 +365,178 @@ class YoyFromRowTest(unittest.TestCase):
         growth = bundle["growth"]
         self.assertEqual(growth["revenue_yoy"], -5.0)
         self.assertEqual(growth["net_profit_yoy"], -5.0)
+
+
+class _FakeHTTPResponse:
+    """Minimal urlopen stand-in: bytes payload + context-manager protocol."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+_EDGAR_TICKERS_FIXTURE = {
+    "0": {"cik_str": 1067983, "ticker": "BRK/B", "title": "BERKSHIRE HATHAWAY INC"},
+    "1": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+}
+
+
+def _edgar_facts_fixture() -> dict:
+    def entry(form, end, fy, fp, frame, val):
+        return {
+            "accn": "0001067983-26-000001",
+            "cik": 1067983,
+            "end": end,
+            "fy": fy,
+            "fp": fp,
+            "form": form,
+            "filed": "2026-11-09",
+            "frame": frame,
+            "val": val,
+        }
+
+    return {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            # Year-to-date cumulative row: same end date, no
+                            # frame — must be skipped, never picked.
+                            entry("10-Q", "2026-09-30", 2026, "Q3", None, 301130000000),
+                            entry("10-Q", "2026-09-30", 2026, "Q3", "CY2026Q3", 105647000000),
+                            entry("10-Q", "2026-06-30", 2026, "Q2", "CY2026Q2", 117885000000),
+                        ]
+                    }
+                },
+                "NetIncomeLoss": {
+                    "units": {
+                        "USD": [
+                            entry("10-Q", "2026-09-30", 2026, "Q3", None, 57885000000),
+                            entry("10-Q", "2026-09-30", 2026, "Q3", "CY2026Q3", 22112000000),
+                        ]
+                    }
+                },
+            }
+        }
+    }
+
+
+def _fake_edgar_opener(request, timeout=None):
+    url = request.full_url if hasattr(request, "full_url") else str(request)
+    if "company_tickers.json" in url:
+        payload = json.dumps(_EDGAR_TICKERS_FIXTURE).encode()
+    elif "companyfacts" in url:
+        payload = json.dumps(_edgar_facts_fixture()).encode()
+    else:  # pragma: no cover - guard against stray live calls in offline tests
+        raise AssertionError(f"unexpected live URL in test: {url}")
+    return _FakeHTTPResponse(payload)
+
+
+class TestSecEdgarQuarterlyFigures(unittest.TestCase):
+    def setUp(self) -> None:
+        _SEC_EDGAR_TICKER_CACHE.clear()
+        _SEC_EDGAR_FACTS_CACHE.clear()
+
+    def test_picks_filed_quarterly_row_and_skips_ytd_row(self) -> None:
+        # BRK-B (Yahoo dash) must resolve to the EDGAR BRK/B ticker, and the
+        # frame-less YTD cumulative row must be ignored.
+        figures = fetch_sec_edgar_quarterly_figures(
+            "BRK-B", "2026-09-30", _opener=_fake_edgar_opener
+        )
+        self.assertEqual(figures, {"revenue": 105647000000.0, "net_income": 22112000000.0})
+
+    def test_q4_has_no_standalone_10q(self) -> None:
+        calls = []
+
+        def _recording_opener(request, timeout=None):
+            calls.append(request)
+            return _fake_edgar_opener(request, timeout)
+
+        self.assertIsNone(
+            fetch_sec_edgar_quarterly_figures("BRK-B", "2025-12-31", _opener=_recording_opener)
+        )
+        self.assertEqual(calls, [])
+
+    def test_fetch_failure_returns_none(self) -> None:
+        def _failing_opener(request, timeout=None):
+            raise OSError("network down")
+
+        self.assertIsNone(
+            fetch_sec_edgar_quarterly_figures("BRK-B", "2026-09-30", _opener=_failing_opener)
+        )
+
+    def test_ticker_map_blocked_falls_back_to_known_cik(self) -> None:
+        # www.sec.gov 403s the ticker map on some egress paths while
+        # data.sec.gov still answers: the known-CIK fallback must keep the
+        # cross-check working instead of silently dropping it.
+        def _blocked_tickers_opener(request, timeout=None):
+            url = request.full_url if hasattr(request, "full_url") else str(request)
+            if "company_tickers.json" in url:
+                raise OSError("403 from ticker map host")
+            return _fake_edgar_opener(request, timeout)
+
+        figures = fetch_sec_edgar_quarterly_figures(
+            "BRK-B", "2026-09-30", _opener=_blocked_tickers_opener
+        )
+        self.assertEqual(figures, {"revenue": 105647000000.0, "net_income": 22112000000.0})
+
+    def test_unknown_ticker_without_map_returns_none(self) -> None:
+        def _blocked_tickers_opener(request, timeout=None):
+            raise OSError("403 from ticker map host")
+
+        self.assertIsNone(
+            fetch_sec_edgar_quarterly_figures("AAPL", "2026-03-31", _opener=_blocked_tickers_opener)
+        )
+
+
+class TestSecEdgarBundleOverride(unittest.TestCase):
+    def setUp(self) -> None:
+        _SEC_EDGAR_TICKER_CACHE.clear()
+        _SEC_EDGAR_FACTS_CACHE.clear()
+
+    def _brk_b_ticker(self):
+        info = {"financialCurrency": "USD", "currency": "USD", "currentPrice": 583.34}
+        income_df = pd.DataFrame(
+            {
+                pd.Timestamp("2026-09-30"): {"Total Revenue": 1.17593e11, "Net Income": 2.2112e10},
+                pd.Timestamp("2026-06-30"): {"Total Revenue": 1.17885e11, "Net Income": 2.5667e10},
+            }
+        )
+        return _build_mock_ticker(info, income_df)
+
+    def test_bundle_prefers_filed_figures_when_edgar_available(self) -> None:
+        fetcher = lambda symbol, report_date: fetch_sec_edgar_quarterly_figures(
+            symbol, report_date, _opener=_fake_edgar_opener
+        )
+        with patch("yfinance.Ticker", return_value=self._brk_b_ticker()):
+            bundle = YfinanceFundamentalAdapter(sec_edgar_fetcher=fetcher).get_fundamental_bundle(
+                "BRK.B"
+            )
+
+        fr = bundle["earnings"]["financial_report"]
+        self.assertEqual(fr["report_date"], "2026-09-30")
+        # Filed 10-Q figures, not Yahoo's statement row ($117.593B).
+        self.assertEqual(fr["revenue"], 105647000000.0)
+        self.assertEqual(fr["net_profit_parent"], 22112000000.0)
+        self.assertIn("earnings.financial_report:sec-edgar", bundle["source_chain"])
+
+    def test_bundle_without_edgar_keeps_yahoo_values(self) -> None:
+        with patch("yfinance.Ticker", return_value=self._brk_b_ticker()):
+            bundle = YfinanceFundamentalAdapter().get_fundamental_bundle("BRK.B")
+
+        fr = bundle["earnings"]["financial_report"]
+        self.assertEqual(fr["revenue"], 1.17593e11)
+        self.assertEqual(fr["net_profit_parent"], 2.2112e10)
+        self.assertNotIn("earnings.financial_report:sec-edgar", bundle["source_chain"])
 
 
 if __name__ == "__main__":

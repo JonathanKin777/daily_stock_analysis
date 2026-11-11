@@ -30,7 +30,7 @@ from src.services.market_symbol_utils import is_suffix_market_symbol
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
 from src.services.stock_list_parser import AnalysisTarget, ParseStatus, parse_analysis_target
 from .fundamental_adapter import AkshareFundamentalAdapter
-from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
+from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter, fetch_sec_edgar_quarterly_figures
 from .realtime_types import CircuitBreaker
 
 # 配置日志
@@ -700,7 +700,9 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
         self._fundamental_adapter = AkshareFundamentalAdapter()
-        self._yfinance_fundamental_adapter = YfinanceFundamentalAdapter()
+        self._yfinance_fundamental_adapter = YfinanceFundamentalAdapter(
+            sec_edgar_fetcher=fetch_sec_edgar_quarterly_figures
+        )
         self._futu_fundamental_fetcher = None
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None

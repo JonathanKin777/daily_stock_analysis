@@ -177,3 +177,25 @@ def get_market_guidelines(stock_code: Optional[str], lang: str = "zh") -> str:
     market = detect_market(stock_code)
     lang_key = "en" if lang in ("en", "ko") else "zh"
     return _MARKET_GUIDELINES.get(market, _MARKET_GUIDELINES["cn"])[lang_key]
+
+
+_CURRENCY_UNITS = {
+    "us": {"zh": "美元", "en": "USD"},
+    "hk": {"zh": "港元", "en": "HKD"},
+    "cn": {"zh": "元", "en": "CNY"},
+    "tw": {"zh": "新台币", "en": "TWD"},
+    "jp": {"zh": "日元", "en": "JPY"},
+    "kr": {"zh": "韩元", "en": "KRW"},
+}
+
+
+def get_currency_unit(stock_code: Optional[str], lang: str = "zh") -> str:
+    """Return the price unit label for the market of ``stock_code``.
+
+    Used to fill the ``{currency_unit_placeholder}`` in the sniper-point
+    examples of the analysis system prompt, so a US-stock report says
+    ``474.00美元`` instead of copying the A-share example ``474.00元``.
+    """
+    market = detect_market(stock_code)
+    lang_key = "en" if lang in ("en", "ko") else "zh"
+    return _CURRENCY_UNITS.get(market, _CURRENCY_UNITS["cn"])[lang_key]

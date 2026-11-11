@@ -102,7 +102,7 @@ from src.schemas.decision_scale import (
     score_band_metadata,
 )
 from src.schemas.report_schema import AnalysisReportSchema
-from src.market_context import detect_market, get_market_role, get_market_guidelines
+from src.market_context import detect_market, get_currency_unit, get_market_role, get_market_guidelines
 from src.services.daily_market_context import format_daily_market_context_prompt_section
 from src.market_phase_prompt import format_market_phase_prompt_section
 from src.market_structure_prompt import format_market_structure_prompt_section
@@ -1269,9 +1269,41 @@ def _is_significant_structural_risk(value: Any) -> bool:
     return "重大" in text and "风险" in normalized
 
 
+_BARE_YUAN_PRICE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*元(?![美元万亿])")
+
+
+def normalize_dashboard_price_units(dashboard: Dict[str, Any], stock_code: str) -> None:
+    """Rewrite bare ``元`` price units in sniper points for non-CN markets.
+
+    The model occasionally still writes ``474.00元`` for a US stock even with
+    a currency-correct prompt example. Sniper-point values are short price
+    strings, so a bare ``元`` after a number is a unit error there; legitimate
+    units are left alone (``美元`` has ``美`` before ``元``; ``亿元``/``万元``
+    are not matched by the lookahead). A-share reports keep ``元`` as-is.
+    """
+    if not isinstance(dashboard, dict):
+        return
+    if detect_market(stock_code) == "cn":
+        return
+    unit = get_currency_unit(stock_code, "zh")
+    battle = dashboard.get("battle_plan")
+    if not isinstance(battle, dict):
+        return
+    sniper = battle.get("sniper_points")
+    if not isinstance(sniper, dict):
+        return
+    for key in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit"):
+        value = sniper.get(key)
+        if isinstance(value, str) and value:
+            fixed = _BARE_YUAN_PRICE_RE.sub(rf"\1{unit}", value)
+            if fixed != value:
+                sniper[key] = fixed
+
+
 def _sync_stability_dashboard_fields(result: "AnalysisResult") -> None:
     dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
     result.dashboard = dashboard
+    normalize_dashboard_price_units(dashboard, getattr(result, "code", ""))
     dashboard["sentiment_score"] = getattr(result, "sentiment_score", None)
     dashboard["operation_advice"] = getattr(result, "operation_advice", None)
     dashboard["decision_type"] = getattr(result, "decision_type", None)
@@ -2034,10 +2066,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "ideal_buy": "理想买入点：XX{currency_unit_placeholder}（在MA5附近）",
+                "secondary_buy": "次优买入点：XX{currency_unit_placeholder}（在MA10附近）",
+                "stop_loss": "止损位：XX{currency_unit_placeholder}（跌破MA20或X%）",
+                "take_profit": "目标位：XX{currency_unit_placeholder}（前高/整数关口）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2222,10 +2254,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想入场位：XX元（满足主要技能触发条件）",
-                "secondary_buy": "次优入场位：XX元（更保守或确认后执行）",
-                "stop_loss": "止损位：XX元（失效条件或X%风险）",
-                "take_profit": "目标位：XX元（按阻力位/风险回报比制定）"
+                "ideal_buy": "理想入场位：XX{currency_unit_placeholder}（满足主要技能触发条件）",
+                "secondary_buy": "次优入场位：XX{currency_unit_placeholder}（更保守或确认后执行）",
+                "stop_loss": "止损位：XX{currency_unit_placeholder}（失效条件或X%风险）",
+                "take_profit": "目标位：XX{currency_unit_placeholder}（按阻力位/风险回报比制定）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2477,10 +2509,10 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
 """ + CANONICAL_DECISION_SCALE_PROMPT_EN + """
 
-""" + _DASHBOARD_JSON_HEAD_EN + """                "ideal_buy": "Ideal buy point: XX (near MA5)",
-                "secondary_buy": "Secondary buy point: XX (near MA10)",
-                "stop_loss": "Stop-loss: XX (break below MA20 or X%)",
-                "take_profit": "Target: XX (previous high/round-number level)"
+""" + _DASHBOARD_JSON_HEAD_EN + """                "ideal_buy": "Ideal buy point: XX {currency_unit_placeholder} (near MA5)",
+                "secondary_buy": "Secondary buy point: XX {currency_unit_placeholder} (near MA10)",
+                "stop_loss": "Stop-loss: XX {currency_unit_placeholder} (break below MA20 or X%)",
+                "take_profit": "Target: XX {currency_unit_placeholder} (previous high/round-number level)"
             },
             "position_strategy": {
                 "suggested_position": "Suggested position: X/10",
@@ -2540,10 +2572,10 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
 """ + CANONICAL_DECISION_SCALE_PROMPT_EN + """
 
-""" + _DASHBOARD_JSON_HEAD_EN + """                "ideal_buy": "Ideal entry: XX (main skill trigger conditions met)",
-                "secondary_buy": "Secondary entry: XX (more conservative or after confirmation)",
-                "stop_loss": "Stop-loss: XX (invalidation condition or X% risk)",
-                "take_profit": "Target: XX (based on resistance/risk-reward ratio)"
+""" + _DASHBOARD_JSON_HEAD_EN + """                "ideal_buy": "Ideal entry: XX {currency_unit_placeholder} (main skill trigger conditions met)",
+                "secondary_buy": "Secondary entry: XX {currency_unit_placeholder} (more conservative or after confirmation)",
+                "stop_loss": "Stop-loss: XX {currency_unit_placeholder} (invalidation condition or X% risk)",
+                "take_profit": "Target: XX {currency_unit_placeholder} (based on resistance/risk-reward ratio)"
             },
             "position_strategy": {
                 "suggested_position": "Suggested position: X/10",
@@ -2685,6 +2717,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         lang = normalize_report_language(report_language)
         market_role = get_market_role(stock_code, lang)
         market_guidelines = get_market_guidelines(stock_code, lang)
+        # Price examples in the sniper-point schema must use the market's own
+        # currency unit (US stocks: 美元/USD), not the hard-coded A-share 元.
+        currency_unit = get_currency_unit(stock_code, lang)
         skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
         # Korean reuses the English scaffolding (same as market review / context pack);
         # the Korean output directive is appended below.
@@ -2697,6 +2732,8 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 "{market_placeholder}", market_role
             ).replace(
                 "{guidelines_placeholder}", market_guidelines
+            ).replace(
+                "{currency_unit_placeholder}", currency_unit
             )
         else:
             skills_section = ""
@@ -2712,6 +2749,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             base_prompt = (
                 template.replace("{market_placeholder}", market_role)
                 .replace("{guidelines_placeholder}", market_guidelines)
+                .replace("{currency_unit_placeholder}", currency_unit)
                 .replace("{default_skill_policy_section}", default_skill_policy_section)
                 .replace("{skills_section}", skills_section)
             )
@@ -4396,7 +4434,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             amount_label = "Realtime Turnover" if realtime_overlay_quote else "Turnover"
             open_label, high_label, low_label = "Open", "High", "Low"
         else:
-            price_unit = " 元"
+            price_unit = " " + get_currency_unit(code, "zh")
             pct_chg_label = "实时涨跌幅" if realtime_overlay_quote else "涨跌幅"
             volume_label = "实时成交量" if realtime_overlay_quote else "成交量"
             amount_label = "实时成交额" if realtime_overlay_quote else "成交额"
@@ -4523,7 +4561,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 ### 实时行情增强数据
 | 指标 | 数值 | 解读 |
 |------|------|------|
-| 当前价格 | {rt.get('price', 'N/A')} 元 | |
+| 当前价格 | {rt.get('price', 'N/A')} {get_currency_unit(code, 'zh')} | |
 | **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
 | **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
@@ -4733,7 +4771,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 指标 | 数值 | 健康标准 |
 |------|------|----------|
 | **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
-| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
+| 平均成本 | {chip.get('avg_cost', 'N/A')} {get_currency_unit(code, 'zh')} | 现价应高于5-15% |
 | 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
 | 筹码状态 | {chip.get('chip_status', unknown_text)} | |
