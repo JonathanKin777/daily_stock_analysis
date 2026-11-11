@@ -1648,6 +1648,102 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("1.35", html)
         self.assertIn("0.82%", html)
 
+    @mock.patch("src.notification.get_config")
+    def test_dashboard_report_volume_line_shows_na_for_missing_or_zero(
+        self, mock_get_config: mock.MagicMock
+    ):
+        """量比/换手率缺失或为假零时报告印 N/A，不印字面 None/0.0%。
+
+        回归：reports-7（v3.1+v3.2 实跑）里三只票的「成交量」行印出
+        "量比 None / 换手率 None%"、BRK.B 印出"换手率 0.0%"。根因是
+        渲染层 `.get(..., 'N/A')` 的默认值只在键缺失时生效，模型 JSON
+        里键在、值为 null/0 时会原样印出。
+        """
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+
+        def _render(volume_analysis: dict, snapshot: Optional[dict] = None) -> str:
+            result = AnalysisResult(
+                code="QQQM",
+                name="纳斯达克100指数ETF",
+                sentiment_score=47,
+                trend_prediction="看空",
+                operation_advice="观望",
+                analysis_summary="观望。",
+                market_snapshot=snapshot,
+                dashboard={
+                    "core_conclusion": {"one_sentence": "观望。"},
+                    "data_perspective": {"volume_analysis": volume_analysis},
+                },
+            )
+            return service.generate_dashboard_report([result], report_date="2026-11-11")
+
+        # v7 原样：模型返回 null（QQQM/SPYM/SMH）
+        markdown = _render(
+            {
+                "volume_ratio": None,
+                "volume_status": "缩量",
+                "turnover_rate": None,
+                "volume_meaning": "量能配合不足",
+            }
+        )
+        self.assertIn("量比 N/A", markdown)
+        self.assertIn("换手率 N/A", markdown)
+        self.assertNotIn("None", markdown)
+
+        # v7 原样：BRK.B 量比 0.74、换手率假零 0.0
+        markdown = _render(
+            {
+                "volume_ratio": 0.74,
+                "volume_status": "缩量",
+                "turnover_rate": 0.0,
+                "volume_meaning": "缩量上涨",
+            }
+        )
+        self.assertIn("量比 0.74", markdown)
+        self.assertIn("换手率 N/A", markdown)
+        self.assertNotIn("0.0%", markdown)
+
+        # 正常值不受影响：量比原样、换手率带 %
+        markdown = _render(
+            {
+                "volume_ratio": "1.35",
+                "volume_status": "放量",
+                "turnover_rate": "0.82",
+                "volume_meaning": "量能配合上攻",
+            }
+        )
+        self.assertIn("量比 1.35", markdown)
+        self.assertIn("换手率 0.82%", markdown)
+
+        # 快照表同口径：None/0 也显示 N/A，不印 None/0.00%
+        markdown = _render(
+            {
+                "volume_ratio": None,
+                "volume_status": "缩量",
+                "turnover_rate": None,
+                "volume_meaning": "量能配合不足",
+            },
+            snapshot={
+                "close": "277.87",
+                "prev_close": "279.52",
+                "open": "276.94",
+                "high": "280.37",
+                "low": "274.68",
+                "pct_chg": "-0.59%",
+                "change_amount": "-1.65",
+                "amplitude": "2.04%",
+                "volume": "343.04 万股",
+                "amount": "N/A",
+                "price": "277.87",
+                "volume_ratio": None,
+                "turnover_rate": 0.0,
+                "source": "YfinanceFetcher",
+            },
+        )
+        self.assertNotIn("None", markdown)
+        self.assertNotIn("0.00%", markdown)
+
     def _make_fundamental_context(self) -> dict:
         return {
             "earnings": {

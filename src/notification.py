@@ -111,6 +111,35 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _format_volume_metric(value: Any, *, with_percent: bool) -> str:
+    """量比/换手率的展示口径：缺失或假零一律显示 N/A，永不在报告里印出
+    字面 None 或 0.0%。
+
+    模型返回的 dashboard JSON 里这两个字段常为 null，换手率算不出时还
+    会返回 0.0；`.get(..., 'N/A')` 的默认值只在键缺失时生效，键在、值
+    为 null/0 时会原样印出（reports-7 复现：三只票"量比 None / 换手率
+    None%"、BRK.B"换手率 0.0%"）。数值正常显示，换手率带 % 后缀，已
+    带 % 的原文不重复加。
+    """
+    if value is None:
+        return "N/A"
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in ("", "none", "null", "n/a", "nan"):
+            return "N/A"
+    numeric = _safe_float(value)
+    if numeric is None:
+        text = str(value).strip()
+        return text or "N/A"
+    if numeric != numeric or numeric == 0:
+        # NaN 或假零：数据源算不出量比/换手率时的占位值
+        return "N/A"
+    if with_percent:
+        text = str(value).strip()
+        return text if text.endswith("%") else f"{text}%"
+    return str(value).strip()
+
+
 def _format_strategy_skill_items(items: Any, report_language: str = "zh") -> str:
     none_text = get_report_labels(report_language).get("none_label", "None")
     if not isinstance(items, list):
@@ -1460,8 +1489,8 @@ class NotificationService(
                     # 量能分析
                     if vol_data:
                         report_lines.extend([
-                            f"**{labels['volume_label']}**: {labels['volume_ratio_label']} {vol_data.get('volume_ratio', 'N/A')} ({vol_data.get('volume_status', '')}) | "
-                            f"{labels['turnover_rate_label']} {vol_data.get('turnover_rate', 'N/A')}%",
+                            f"**{labels['volume_label']}**: {labels['volume_ratio_label']} {_format_volume_metric(vol_data.get('volume_ratio'), with_percent=False)} ({vol_data.get('volume_status', '')}) | "
+                            f"{labels['turnover_rate_label']} {_format_volume_metric(vol_data.get('turnover_rate'), with_percent=True)}",
                             f"💡 *{vol_data.get('volume_meaning', '')}*",
                             "",
                         ])
@@ -2165,8 +2194,8 @@ class NotificationService(
                 "",
                 f"| {labels['current_price_label']} | {labels['volume_ratio_label']} | {labels['turnover_rate_label']} | {labels['source_label']} |",
                 "|-------|------|--------|----------|",
-                f"| {snapshot.get('price', 'N/A')} | {snapshot.get('volume_ratio', 'N/A')} | "
-                f"{snapshot.get('turnover_rate', 'N/A')} | {display_source} |",
+                f"| {snapshot.get('price', 'N/A')} | {_format_volume_metric(snapshot.get('volume_ratio'), with_percent=False)} | "
+                f"{_format_volume_metric(snapshot.get('turnover_rate'), with_percent=True)} | {display_source} |",
             ])
 
         lines.append("")
