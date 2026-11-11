@@ -650,7 +650,8 @@ class StockAnalysisPipeline:
                     # Issue #234: Augment with realtime for intraday MA calculation
                     if self.config.enable_realtime_quote and realtime_quote:
                         df = self._augment_historical_with_realtime(
-                            df, realtime_quote, code, market=market
+                            df, realtime_quote, code, market=market,
+                            is_partial_bar=market_phase_context_dict.get("is_partial_bar"),
                         )
                     trend_result = self.trend_analyzer.analyze(df, code)
                     logger.info(f"{stock_name}({code}) 趋势分析: {trend_result.trend_status.value}, "
@@ -2769,6 +2770,7 @@ class StockAnalysisPipeline:
         realtime_quote: Any,
         code: str,
         market: Optional[str] = None,
+        is_partial_bar: Optional[bool] = None,
     ) -> pd.DataFrame:
         """
         使用当日实时行情补齐历史 OHLCV，用于盘中 MA 计算。
@@ -2787,6 +2789,14 @@ class StockAnalysisPipeline:
             self.config, 'enable_realtime_technical_indicators', True
         )
         if not enable_realtime_tech:
+            return df
+        # 盘后/盘前不补：实时价只是上一收盘价，把它追加为新一日 K 线会让
+        # MA 整体平移一根（2026-11-11 试跑：05:00 UTC 已过美东午夜，
+        # SPYM 因此多出一根 11-11 的虚拟 bar，MA5/10/20 全错；同批其余
+        # 三只在午夜前处理、走更新分支才没中招）。只有盘中 partial bar
+        # 才代表真实的当日行情。phase 未知（None）时沿用旧行为，兼容
+        # 直接调用与既有单测。
+        if is_partial_bar is False:
             return df
         if market is None:
             market = get_market_for_stock(code)

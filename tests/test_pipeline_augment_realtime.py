@@ -87,6 +87,51 @@ class AugmentRealtimeMarketDateTestCase(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["close"], 30.0)
 
+    @patch("src.core.pipeline.is_market_open", return_value=True)
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_skips_augmentation_when_not_partial_bar(
+        self, _mock_market, mock_now, _mock_open
+    ):
+        """Regression (2026-11-11 SPYM): the run straddled US midnight, so
+        the date-based gate passed on a trading day at 00:00 ET and the
+        realtime quote — just the previous close — was appended as a new
+        11-11 bar, shifting MA5/MA10/MA20 by one bar. With
+        is_partial_bar=False the augment must not run at all."""
+        # 2026-11-11 05:00 UTC = 2026-11-11 00:00 ET (pre-market).
+        mock_now.return_value = datetime(2026, 11, 11, 0, 0)
+
+        df = _make_df([(date(2026, 11, 10), 88.28)])
+        quote = SimpleNamespace(price=88.28, open_price=88.28, high=88.28, low=88.28, volume=0, amount=None, change_pct=0.0, pre_close=None)
+
+        pipeline = _make_pipeline()
+        result = pipeline._augment_historical_with_realtime(
+            df, quote, "SPYM", is_partial_bar=False
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["close"], 88.28)
+
+    @patch("src.core.pipeline.is_market_open", return_value=True)
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_appends_when_partial_bar_intraday(
+        self, _mock_market, mock_now, _mock_open
+    ):
+        """Intraday partial bar: the realtime price is real trading, append."""
+        mock_now.return_value = datetime(2026, 3, 27, 15, 0)
+
+        df = _make_df([(date(2026, 3, 26), 150.0)])
+        quote = SimpleNamespace(price=155.0, open_price=151.0, high=156.0, low=149.0, volume=200, amount=None, change_pct=3.0, pre_close=None)
+
+        pipeline = _make_pipeline()
+        result = pipeline._augment_historical_with_realtime(
+            df, quote, "AAPL", is_partial_bar=True
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result.iloc[-1]["close"], 155.0)
+
 
 if __name__ == "__main__":
     unittest.main()

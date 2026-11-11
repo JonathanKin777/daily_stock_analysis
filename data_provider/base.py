@@ -2812,9 +2812,16 @@ class DataFetcherManager:
         for f in cls._SUPPLEMENT_FIELDS:
             if getattr(primary, f, None) is None:
                 val = getattr(secondary, f, None)
-                if val is not None:
-                    setattr(primary, f, val)
-                    filled.append(f)
+                if val is None:
+                    continue
+                if f == "turnover_rate" and val == 0:
+                    # 换手率 0 不是有效测量：源算不出时会返回 0（例如美股
+                    # ETF 没有流通股本口径），接受它会在报告里写出一个假
+                    # 的 0.0%（2026-11-11 试跑 QQQM）。保持缺失，提示侧
+                    # 会显示 N/A 而非假零。
+                    continue
+                setattr(primary, f, val)
+                filled.append(f)
         return filled
 
     def _order_us_sources_by_priority(self, source_order: List[str], *, pin_first: bool) -> List[str]:

@@ -55,6 +55,23 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _correct_brk_b_pb_ratio(symbol: str, pb_ratio: Optional[float]) -> Optional[float]:
+    """Correct Yahoo's ``priceToBook`` for Berkshire B shares.
+
+    Yahoo reports BRK-B's ``bookValue`` on the A-share scale (~$536k per
+    share), so ``priceToBook`` comes back as ~0.001 instead of ~1.63. One B
+    share is 1/1500 of an A share, so the true PB is ``priceToBook * 1500``.
+    Only correct implausibly small values (< 0.05): if Yahoo ever switches
+    to the B-share book value (~1.6), no correction applies. Verified live
+    2026-11-11: priceToBook=0.001087483, bookValue=536413.0 -> 1.63.
+    """
+    if pb_ratio is None:
+        return None
+    if symbol in ("BRK.B", "BRK-B") and pb_ratio < 0.05:
+        return pb_ratio * 1500
+    return pb_ratio
+
+
 class YfinanceFetcher(BaseFetcher):
     """
     Yahoo Finance 数据源实现
@@ -891,13 +908,17 @@ class YfinanceFetcher(BaseFetcher):
                 ticker_info = {}
             try:
                 info_name = ticker_info.get('shortName', '') or ticker_info.get('longName', '') or ''
-                name = info_name if is_meaningful_stock_name(info_name, symbol) else STOCK_NAME_MAP.get(symbol, '')
+                # 查表用仓库内代码（BRK.B），而非 Yahoo 形式的 symbol（BRK-B）：
+                # 映射表只收 canonical key，连字符形式查不到。
+                name = info_name if is_meaningful_stock_name(info_name, symbol) else (
+                    STOCK_NAME_MAP.get(stock_code) or STOCK_NAME_MAP.get(symbol, '')
+                )
             except Exception:
-                name = STOCK_NAME_MAP.get(symbol, '')
+                name = STOCK_NAME_MAP.get(stock_code) or STOCK_NAME_MAP.get(symbol, '')
 
             # 复用上方已获取的 ticker_info，无额外请求
             pe_ratio = _safe_float(ticker_info.get('trailingPE'))
-            pb_ratio = _safe_float(ticker_info.get('priceToBook'))
+            pb_ratio = _correct_brk_b_pb_ratio(symbol, _safe_float(ticker_info.get('priceToBook')))
 
             missing_fields = [
                 field

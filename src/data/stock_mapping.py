@@ -92,6 +92,16 @@ STOCK_NAME_MAP = {
     "LI": "理想汽车",
     "COIN": "Coinbase",
     "MSTR": "MicroStrategy",
+    # === US ETFs / watchlist (2026-11-11 v3.2) ===
+    # 持仓四只票的中文身份：名称解析全失败时 prompt 不再只剩"股票SPYM"，
+    # 模型也就不会凭空编一个"SPDR标普中盘ETF"出来（v3 实测教训）。
+    # 只写仓库内的点号形式 BRK.B（canonical key）；Yahoo 侧的连字符形式
+    # 由 fetcher 按仓库内代码查表，不再另写一条，否则会破坏
+    # STOCK_ENGLISH_NAME_MAP 的 canonical 键约束。
+    "QQQM": "纳斯达克100指数ETF",
+    "SMH": "半导体ETF",
+    "BRK.B": "伯克希尔·哈撒韦B类股",
+    "SPYM": "标普500指数ETF",
     # === HK stocks (5-digit) ===
     "00700": "腾讯控股",
     "03690": "美团",
@@ -158,6 +168,11 @@ STOCK_ENGLISH_NAME_MAP: Dict[str, Tuple[str, ...]] = {
     "LI": ("Li Auto Inc.", "Li Auto"),
     "COIN": ("Coinbase Global, Inc.", "Coinbase"),
     "MSTR": ("MicroStrategy Incorporated", "MicroStrategy"),
+    # === US ETFs / watchlist (2026-11-11 v3.2; 与 STOCK_NAME_MAP 同步) ===
+    "QQQM": ("Invesco NASDAQ 100 ETF", "Nasdaq 100"),
+    "SMH": ("VanEck Semiconductor ETF", "VanEck Semiconductor"),
+    "BRK.B": ("Berkshire Hathaway Inc.", "Berkshire Hathaway"),
+    "SPYM": ("SPDR Portfolio S&P 500 ETF", "SPDR S&P 500"),
     # === HK stocks (5-digit) ===
     "00700": ("Tencent Holdings", "Tencent"),
     "03690": ("Meituan",),

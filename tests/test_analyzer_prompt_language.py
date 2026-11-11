@@ -9,6 +9,7 @@ enum values and the Chinese template unchanged.
 """
 
 import copy
+import json
 import re
 import unittest
 from types import SimpleNamespace
@@ -22,7 +23,13 @@ except ModuleNotFoundError:
     ensure_litellm_stub()
 
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_EN, CORE_TRADING_SKILL_POLICY_ZH
-from src.analyzer import GeminiAnalyzer, _legacy_audit_marker_specs, normalize_dashboard_price_units
+from src.analyzer import (
+    AnalysisResult,
+    GeminiAnalyzer,
+    _legacy_audit_marker_specs,
+    normalize_dashboard_price_units,
+    normalize_stock_identity_terms,
+)
 from src.market_context import get_currency_unit
 
 # CJK ideographs plus full-width punctuation/forms. Hangul is intentionally not
@@ -205,6 +212,29 @@ class EnglishStockPromptTemplateTestCase(unittest.TestCase):
         self.assertIn("专注于趋势交易", system_prompt)
         self.assertNotIn("Decision Dashboard", system_prompt)
 
+    def test_realtime_missing_ratios_render_as_na_not_none(self) -> None:
+        """Missing volume_ratio / turnover_rate must render N/A, not the
+        literal None (2026-11-11 run printed '换手率 None%' for SPYM/SMH)."""
+        analyzer = _make_analyzer(legacy=True)
+        fake_cfg = SimpleNamespace(news_max_age_days=3, news_strategy_profile="short")
+        context = copy.deepcopy(_rich_context())
+        context["realtime"]["volume_ratio"] = None
+        context["realtime"]["turnover_rate"] = None
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            zh_prompt = analyzer._format_prompt(context, "Apple", news_context="n", report_language="zh")
+            en_prompt = analyzer._format_prompt(copy.deepcopy(context), "Apple", news_context="n", report_language="en")
+            normal_prompt = analyzer._format_prompt(_rich_context(), "Apple", news_context="n", report_language="zh")
+
+        self.assertIn("| **量比** | **N/A** |", zh_prompt)
+        self.assertIn("| **换手率** | **N/A** |", zh_prompt)
+        self.assertIn("| **Volume Ratio** | **N/A** |", en_prompt)
+        self.assertIn("| **Turnover Rate** | **N/A** |", en_prompt)
+        self.assertNotIn("None%", zh_prompt)
+        self.assertNotIn("None%", en_prompt)
+        # Normal values still render as before.
+        self.assertIn("| **量比** | **1.3** |", normal_prompt)
+        self.assertIn("| **换手率** | **2.1%** |", normal_prompt)
+
     def test_english_audit_markers_match_english_prompt_headers(self) -> None:
         markers = {
             marker["marker_name"]: marker["text"]
@@ -356,6 +386,182 @@ class TestSniperPointCurrencyUnit(unittest.TestCase):
         self.assertNotIn("9.5 元", us_prompt)
         self.assertIn("10.5 元", cn_prompt)
         self.assertIn("9.5 元", cn_prompt)
+
+
+class TestV32AmountUnitAndIdentityFixes(unittest.TestCase):
+    """v3.2: amounts use the market currency; SPYM must never be mid-cap.
+
+    2026-11-11 trial run: the prompt wrote BRK.B's market cap as
+    "12393.17 亿元" (should be 亿美元), and the model, given only
+    "股票SPYM" as the name, invented "SPDR标普中盘ETF" and reused
+    "中盘宽基" / "中盘类资产" in the narrative.
+    """
+
+    def test_format_amount_uses_market_currency_unit(self) -> None:
+        analyzer = _make_analyzer(legacy=False)
+        # BRK.B market cap from the 2026-11-11 trial run (live Yahoo value).
+        self.assertEqual(
+            analyzer._format_amount(1239317086208, currency_unit="美元"),
+            "12393.17 亿美元",
+        )
+        self.assertEqual(
+            analyzer._format_amount(1239317086208, currency_unit="港元"),
+            "12393.17 亿港元",
+        )
+        self.assertEqual(analyzer._format_amount(987654321, currency_unit="美元"), "9.88 亿美元")
+        self.assertEqual(analyzer._format_amount(5000, currency_unit="美元"), "5000 美元")
+        # Legacy callers that pass no unit keep the old 元 behaviour.
+        self.assertEqual(analyzer._format_amount(1239317086208), "12393.17 亿元")
+        self.assertEqual(analyzer._format_amount(None, currency_unit="美元"), "N/A")
+        self.assertEqual(analyzer._format_amount(1239317086208, "en"), "1239.32B")
+
+    def test_user_prompt_market_cap_uses_market_currency(self) -> None:
+        analyzer = _make_analyzer(legacy=False)
+        fake_cfg = SimpleNamespace(news_max_age_days=3, news_strategy_profile="short")
+        context = _rich_context()
+        context["code"] = "SPYM"
+        context["stock_name"] = "标普500指数ETF"
+        context["realtime"]["total_mv"] = 1239317086208
+        context["realtime"]["circ_mv"] = 1239317086208
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            prompt = analyzer._format_prompt(
+                context, "标普500指数ETF", news_context="n", report_language="zh"
+            )
+        self.assertIn("12393.17 亿美元", prompt)
+        self.assertNotIn("12393.17 亿元", prompt)
+        # The turnover row follows the same rule (987654321 -> 9.88 亿美元).
+        self.assertIn("9.88 亿美元", prompt)
+        self.assertNotIn("9.88 亿元", prompt)
+
+    def test_user_prompt_uses_mapped_chinese_name_for_spym(self) -> None:
+        analyzer = _make_analyzer(legacy=False)
+        fake_cfg = SimpleNamespace(news_max_age_days=3, news_strategy_profile="short")
+        context = _rich_context()
+        context["code"] = "SPYM"
+        context.pop("stock_name", None)
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            prompt = analyzer._format_prompt(
+                context, "股票SPYM", news_context="n", report_language="zh"
+            )
+        self.assertIn("标普500指数ETF", prompt)
+        # The stock-name row now carries the mapped name. The prompt's
+        # "output the correct name" instruction still quotes the fallback
+        # form ("股票SPYM") conditionally, so it may appear elsewhere in
+        # the template; only the displayed name row must be correct.
+        self.assertIn("| 股票名称 | **标普500指数ETF** |", prompt)
+
+    def test_market_snapshot_amount_uses_market_currency(self) -> None:
+        analyzer = _make_analyzer(legacy=False)
+        snapshot = analyzer._build_market_snapshot(_rich_context(), currency_unit="美元")
+        self.assertEqual(snapshot["amount"], "9.88 亿美元")
+        snapshot_cn = analyzer._build_market_snapshot(_rich_context())
+        self.assertEqual(snapshot_cn["amount"], "9.88 亿元")
+
+    def test_normalize_stock_identity_terms_fixes_spym_mislabels(self) -> None:
+        result = AnalysisResult(
+            code="SPYM",
+            name="SPDR标普中盘ETF（SPYM）",
+            sentiment_score=44,
+            trend_prediction="震荡",
+            operation_advice="观望",
+            dashboard={
+                "intelligence": {
+                    "sentiment_summary": "大盘风险偏好较低，市场对中盘宽基偏向防守中性观望",
+                    "risk_alerts": ["中盘类资产波动承压", "中盘股跑输大盘指数"],
+                    "hot_topics": "美股大盘防守轮动、标普中盘配置",
+                }
+            },
+            sector_position="所属美股大盘及中盘板块在宏观谨慎预期下整体承压",
+            raw_response='{"stock_name": "SPDR标普中盘ETF（SPYM）"}',
+        )
+        normalize_stock_identity_terms(result)
+        self.assertEqual(result.name, "SPDR标普500指数ETF（SPYM）")
+        intel = result.dashboard["intelligence"]
+        self.assertEqual(
+            intel["sentiment_summary"], "大盘风险偏好较低，市场对大盘宽基偏向防守中性观望"
+        )
+        self.assertEqual(intel["risk_alerts"][0], "大盘类资产波动承压")
+        # Legitimate market-segment wording is untouched.
+        self.assertEqual(intel["risk_alerts"][1], "中盘股跑输大盘指数")
+        self.assertEqual(intel["hot_topics"], "美股大盘防守轮动、标普500配置")
+        self.assertEqual(result.sector_position, "所属美股大盘及中盘板块在宏观谨慎预期下整体承压")
+        # Raw model output is kept verbatim for audit.
+        self.assertIn("SPDR标普中盘ETF", result.raw_response)
+
+    def test_normalize_stock_identity_terms_skips_other_tickers(self) -> None:
+        result = AnalysisResult(
+            code="QQQM",
+            name="纳斯达克100指数ETF",
+            sentiment_score=50,
+            trend_prediction="震荡",
+            operation_advice="观望",
+            sector_position="中盘宽基表现分化",
+        )
+        normalize_stock_identity_terms(result)
+        self.assertEqual(result.sector_position, "中盘宽基表现分化")
+
+    def test_analyze_corrects_spym_mislabels_end_to_end(self) -> None:
+        # The guard hook lives in analyze(), after _parse_response: a canned
+        # v3-style SPYM reply (model invents the 中盘ETF name because the
+        # input name was the bare fallback "股票SPYM") must come out
+        # corrected in the final result.
+        analyzer = GeminiAnalyzer.__new__(GeminiAnalyzer)
+        analyzer._router = None
+        analyzer._litellm_available = True
+        analyzer._skill_instructions_override = ""
+        analyzer._default_skill_policy_override = ""
+        analyzer._use_legacy_default_prompt_override = False
+        analyzer._config_override = SimpleNamespace(
+            generation_backend="litellm",
+            generation_fallback_backend="litellm",
+            litellm_model="gemini/gemini-3.6-flash",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+            report_language="zh",
+            gemini_request_delay=0,
+            llm_temperature=0.7,
+            report_integrity_enabled=False,
+            report_integrity_retry=0,
+            news_max_age_days=3,
+            news_strategy_profile="short",
+        )
+        response_text = json.dumps(
+            {
+                "stock_name": "SPDR标普中盘ETF（SPYM）",
+                "sentiment_score": 44,
+                "trend_prediction": "震荡",
+                "operation_advice": "观望",
+                "decision_type": "hold",
+                "confidence_level": "中",
+                "dashboard": {
+                    "intelligence": {
+                        "sentiment_summary": "市场对中盘宽基偏向防守中性观望",
+                        "risk_alerts": ["中盘类资产波动承压"],
+                    }
+                },
+                "sector_position": "所属美股大盘及中盘板块承压",
+            },
+            ensure_ascii=False,
+        )
+
+        def _fake_call(prompt, generation_config, **kwargs):
+            return response_text, "gemini/gemini-3.6-flash", {}
+
+        context = _rich_context()
+        context["code"] = "SPYM"
+        context["stock_name"] = "股票SPYM"
+        with patch.object(analyzer, "_call_litellm", side_effect=_fake_call):
+            result = analyzer.analyze(context, news_context="n")
+        self.assertTrue(result.success)
+        # With the mapped name in place the model's invented name is not
+        # adopted at all (the parse step only takes the AI name when the
+        # input name is the bare fallback); the guard's job is the
+        # narrative fields below.
+        self.assertEqual(result.name, "标普500指数ETF")
+        intel = result.dashboard["intelligence"]
+        self.assertIn("大盘宽基", intel["sentiment_summary"])
+        self.assertNotIn("中盘宽基", intel["sentiment_summary"])
+        self.assertIn("大盘类资产", intel["risk_alerts"][0])
 
 
 if __name__ == "__main__":

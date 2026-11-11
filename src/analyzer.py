@@ -1300,6 +1300,59 @@ def normalize_dashboard_price_units(dashboard: Dict[str, Any], stock_code: str) 
                 sniper[key] = fixed
 
 
+# 2026-11-11 v3.2：模型对 ETF 身份的误标纠正表。
+# 根因（v3 实测）：SPYM 的名称解析全失败，prompt 里只剩"股票SPYM"，模型
+# 凭空编出"SPDR标普中盘ETF"，并在 sentiment_summary / risk_alerts 等处
+# 反复用"中盘宽基""中盘类资产"描述它。STOCK_NAME_MAP 已补四只票的中文名
+# （prompt 层），这里是解析后的最后一道防线：只纠正"标的身份"类措辞，
+# 不碰数字与结论，也不碰"中盘股"这类合法的市场板块表述。
+_STOCK_IDENTITY_MISLABEL_FIXES: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    "SPYM": (
+        ("SPDR标普中盘ETF", "SPDR标普500指数ETF"),
+        ("标普中盘", "标普500"),
+        ("中盘宽基", "大盘宽基"),
+        ("中盘类资产", "大盘类资产"),
+    ),
+}
+
+_IDENTITY_TEXT_EXCLUDE_FIELDS = frozenset({"raw_response", "code", "error_message"})
+
+
+def _fix_identity_terms_in_value(value: Any, fixes: Tuple[Tuple[str, str], ...]) -> Any:
+    if isinstance(value, str):
+        for wrong, right in fixes:
+            value = value.replace(wrong, right)
+        return value
+    if isinstance(value, dict):
+        return {key: _fix_identity_terms_in_value(item, fixes) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_fix_identity_terms_in_value(item, fixes) for item in value)
+    if isinstance(value, list):
+        return [_fix_identity_terms_in_value(item, fixes) for item in value]
+    return value
+
+
+def normalize_stock_identity_terms(result: "AnalysisResult") -> None:
+    """Correct model-invented identity labels for a ticker (v3.2).
+
+    Only applies to tickers listed in ``_STOCK_IDENTITY_MISLABEL_FIXES``.
+    Rewrites the mislabel phrases in every narrative text field of the
+    parsed result, including nested dashboard strings, so every renderer
+    sees the corrected text. Numbers, scores and decisions are untouched;
+    ``raw_response`` keeps the model's original wording for audit.
+    """
+    code = getattr(result, "code", "") or ""
+    fixes = _STOCK_IDENTITY_MISLABEL_FIXES.get(code)
+    if not fixes:
+        return
+    for field_name, value in list(vars(result).items()):
+        if field_name in _IDENTITY_TEXT_EXCLUDE_FIELDS:
+            continue
+        fixed = _fix_identity_terms_in_value(value, fixes)
+        if fixed != value:
+            setattr(result, field_name, fixed)
+
+
 def _sync_stability_dashboard_fields(result: "AnalysisResult") -> None:
     dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
     result.dashboard = dashboard
@@ -4312,7 +4365,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 result = self._parse_response(response_text, code, name)
                 result.raw_response = response_text
                 result.search_performed = bool(news_context)
-                result.market_snapshot = self._build_market_snapshot(context)
+                result.market_snapshot = self._build_market_snapshot(
+                    context, currency_unit=get_currency_unit(code, "zh")
+                )
                 result.model_used = model_used
                 result.report_language = report_language
                 normalize_chip_structure_availability(result, context.get("chip"))
@@ -4355,6 +4410,10 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
             if should_persist_usage_telemetry(llm_usage):
                 persist_llm_usage(llm_usage, model_used, call_type="analysis", stock_code=code)
+
+            # v3.2：纠正模型对标的身份的误标（如把 SPYM 写成"中盘"），
+            # 只改身份类措辞，不动数字与结论。
+            normalize_stock_identity_terms(result)
 
             logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
 
@@ -4454,7 +4513,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             [
                 f"| {pct_chg_label} | {today.get('pct_chg', 'N/A')}% |",
                 f"| {volume_label} | {self._format_volume(today.get('volume'), report_language)} |",
-                f"| {amount_label} | {self._format_amount(today.get('amount'), report_language)} |",
+                f"| {amount_label} | {self._format_amount(today.get('amount'), report_language, currency_unit=get_currency_unit(code, 'zh'))} |",
             ]
         )
         quote_rows_text = "\n".join(quote_rows)
@@ -4542,13 +4601,20 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         # 添加实时行情数据（量比、换手率等）
         if 'realtime' in context and english:
             rt = context['realtime']
+            # 缺失值显示 N/A：rt.get 的默认值只在键不存在时生效，键存在
+            # 但值为 None 时原样输出 "None" 会被模型当成事实复述
+            # （2026-11-11 试跑：SPYM/SMH 的换手率印成了 "None%"）。
+            rt_volume_ratio_text = rt.get('volume_ratio')
+            rt_volume_ratio_text = 'N/A' if rt_volume_ratio_text is None else rt_volume_ratio_text
+            rt_turnover_rate_text = rt.get('turnover_rate')
+            rt_turnover_rate_text = 'N/A' if rt_turnover_rate_text is None else f'{rt_turnover_rate_text}%'
             prompt += f"""
 ### Realtime Quote Details
 | Indicator | Value | Interpretation |
 |------|------|------|
 | Current Price | {rt.get('price', 'N/A')} | |
-| **Volume Ratio** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
-| **Turnover Rate** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| **Volume Ratio** | **{rt_volume_ratio_text}** | {rt.get('volume_ratio_desc', '')} |
+| **Turnover Rate** | **{rt_turnover_rate_text}** | |
 | PE (TTM/dynamic) | {rt.get('pe_ratio', 'N/A')} | |
 | PB | {rt.get('pb_ratio', 'N/A')} | |
 | Total Market Cap | {self._format_amount(rt.get('total_mv'), report_language)} | |
@@ -4557,17 +4623,21 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 """
         elif 'realtime' in context:
             rt = context['realtime']
+            rt_volume_ratio_text = rt.get('volume_ratio')
+            rt_volume_ratio_text = 'N/A' if rt_volume_ratio_text is None else rt_volume_ratio_text
+            rt_turnover_rate_text = rt.get('turnover_rate')
+            rt_turnover_rate_text = 'N/A' if rt_turnover_rate_text is None else f'{rt_turnover_rate_text}%'
             prompt += f"""
 ### 实时行情增强数据
 | 指标 | 数值 | 解读 |
 |------|------|------|
 | 当前价格 | {rt.get('price', 'N/A')} {get_currency_unit(code, 'zh')} | |
-| **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
-| **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| **量比** | **{rt_volume_ratio_text}** | {rt.get('volume_ratio_desc', '')} |
+| **换手率** | **{rt_turnover_rate_text}** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
 | 市净率 | {rt.get('pb_ratio', 'N/A')} | |
-| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
-| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'), currency_unit=get_currency_unit(code, 'zh'))} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'), currency_unit=get_currency_unit(code, 'zh'))} | |
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
 
@@ -5183,18 +5253,31 @@ Output the complete Decision Dashboard in JSON format."""
         else:
             return f"{volume:.0f} 股"
     
-    def _format_amount(self, amount: Optional[float], report_language: str = "zh") -> str:
-        """格式化成交额显示"""
+    def _format_amount(
+        self,
+        amount: Optional[float],
+        report_language: str = "zh",
+        currency_unit: Optional[str] = None,
+    ) -> str:
+        """格式化成交额显示
+
+        ``currency_unit`` 是金额的币种单位（美元/港元/元，见
+        :func:`src.market_context.get_currency_unit`）。不传时沿用旧行为
+        （元），避免历史调用方静默变义；中文 prompt 里的总市值/流通市值/
+        成交额必须传本市场币种，否则美股金额会被写成"亿元"（v3.2 实测：
+        BRK.B 总市值 12393.17 亿元，应为 12393.17 亿美元）。
+        """
         if amount is None:
             return 'N/A'
         if normalize_report_language(report_language) in ("en", "ko"):
             return self._format_scaled_number_en(amount)
+        unit = currency_unit or "元"
         if amount >= 1e8:
-            return f"{amount / 1e8:.2f} 亿元"
+            return f"{amount / 1e8:.2f} 亿{unit}"
         elif amount >= 1e4:
-            return f"{amount / 1e4:.2f} 万元"
+            return f"{amount / 1e4:.2f} 万{unit}"
         else:
-            return f"{amount:.0f} 元"
+            return f"{amount:.0f} {unit}"
 
     @staticmethod
     def _format_scaled_number_en(value: float) -> str:
@@ -5225,7 +5308,9 @@ Output the complete Decision Dashboard in JSON format."""
         except (TypeError, ValueError):
             return 'N/A'
 
-    def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_market_snapshot(
+        self, context: Dict[str, Any], currency_unit: Optional[str] = None
+    ) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
         today = context.get('today', {}) or {}
         realtime = context.get('realtime', {}) or {}
@@ -5260,7 +5345,7 @@ Output the complete Decision Dashboard in JSON format."""
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
             "volume": self._format_volume(today.get('volume')),
-            "amount": self._format_amount(today.get('amount')),
+            "amount": self._format_amount(today.get('amount'), currency_unit=currency_unit),
         }
 
         if realtime:

@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data_provider.us_index_mapping import is_us_stock_code
-from data_provider.yfinance_fetcher import YfinanceFetcher
+from data_provider.yfinance_fetcher import YfinanceFetcher, _correct_brk_b_pb_ratio
 from data_provider.yfinance_fundamental_adapter import _convert_to_yf_symbol
 
 
@@ -44,3 +44,18 @@ def test_fundamental_adapter_symbol_maps_brk_b_to_hyphen() -> None:
     assert _convert_to_yf_symbol("0700.HK") == "0700.HK"
     assert _convert_to_yf_symbol("7203.T") == "7203.T"
     assert _convert_to_yf_symbol("2330.TW") == "2330.TW"
+
+
+def test_correct_brk_b_pb_ratio_scales_a_share_book_value() -> None:
+    # Live Yahoo values verified 2026-11-11: priceToBook=0.001087483,
+    # bookValue=536413.0 (A-share scale) -> true PB ~1.63.
+    assert abs(_correct_brk_b_pb_ratio("BRK-B", 0.001087483) - 1.6312245) < 1e-6
+    assert abs(_correct_brk_b_pb_ratio("BRK.B", 0.001087483) - 1.6312245) < 1e-6
+
+
+def test_correct_brk_b_pb_ratio_leaves_sane_values_alone() -> None:
+    # If Yahoo ever switches to the B-share book value (~1.6), no correction.
+    assert _correct_brk_b_pb_ratio("BRK-B", 1.63) == 1.63
+    assert _correct_brk_b_pb_ratio("BRK-B", None) is None
+    # Other tickers are never rescaled, even for tiny values.
+    assert _correct_brk_b_pb_ratio("AAPL", 0.001) == 0.001

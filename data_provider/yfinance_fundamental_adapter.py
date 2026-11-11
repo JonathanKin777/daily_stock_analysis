@@ -222,12 +222,17 @@ def _quarter_of_iso_date(iso_date: Any) -> Optional[tuple]:
 def fetch_sec_edgar_quarterly_figures(
     symbol: str, report_date: Any, _opener=None
 ) -> Optional[Dict[str, float]]:
-    """Return filed quarterly ``{"revenue": ..., "net_income": ...}`` for a US stock.
+    """Return filed quarterly figures for a US stock.
 
     Matches the 10-Q whose period end equals ``report_date`` (the quarter-end
-    taken from Yahoo's income statement). Frame-less rows are year-to-date
-    cumulative figures and are skipped. Q4 has no standalone 10-Q (the 10-K
-    reports the full year), so Q4 always returns None and keeps Yahoo data.
+    taken from Yahoo's income statement): ``{"revenue": ..., "net_income": ...}``.
+    When the same filing also carries the prior-year quarter as a framed
+    comparative row, ``prev_revenue`` / ``prev_net_income`` are included so
+    callers can compute YoY from filed numbers instead of Yahoo's ``info``
+    ratios (Yahoo's prior-year statement rows are often NaN, e.g. BRK.B
+    2025-09-30). Frame-less rows are year-to-date cumulative figures and are
+    skipped. Q4 has no standalone 10-Q (the 10-K reports the full year), so
+    Q4 always returns None and keeps Yahoo data.
     """
     quarter = _quarter_of_iso_date(report_date)
     if quarter is None or quarter[1] == 4:
@@ -247,22 +252,43 @@ def fetch_sec_edgar_quarterly_figures(
     if not isinstance(facts, dict):
         return None
     units = facts.get("facts", {}).get("us-gaap", {})
-    out: Dict[str, float] = {}
-    for concept, field in (("Revenues", "revenue"), ("NetIncomeLoss", "net_income")):
-        entries = units.get(concept, {}).get("units", {}).get("USD", [])
+    try:
+        prev_date = datetime.strptime(str(report_date), "%Y-%m-%d").date().replace(year=year - 1)
+    except (TypeError, ValueError):
+        prev_date = None
+    prev_frame = f"CY{year - 1}Q{q}"
+
+    def _match_quarter(entries, end, frame) -> Optional[float]:
+        # The prior-year quarter is carried by the current filing as a
+        # comparative row (same fy/fp, its own frame); the current quarter
+        # matches any non-empty frame.
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("form") != "10-Q" or entry.get("end") != report_date:
+            if entry.get("form") != "10-Q" or entry.get("end") != end:
                 continue
             if entry.get("fy") != year or entry.get("fp") != f"Q{q}":
                 continue
-            if not entry.get("frame"):
+            if frame is None:
+                if not entry.get("frame"):
+                    continue
+            elif entry.get("frame") != frame:
                 continue
             value = _safe_float(entry.get("val"))
             if value is not None:
-                out[field] = value
-                break
+                return value
+        return None
+
+    out: Dict[str, float] = {}
+    for concept, field in (("Revenues", "revenue"), ("NetIncomeLoss", "net_income")):
+        entries = units.get(concept, {}).get("units", {}).get("USD", [])
+        value = _match_quarter(entries, report_date, None)
+        if value is not None:
+            out[field] = value
+        if prev_date is not None:
+            prev_value = _match_quarter(entries, prev_date.isoformat(), prev_frame)
+            if prev_value is not None:
+                out[f"prev_{field}"] = prev_value
     return out or None
 
 
@@ -408,6 +434,24 @@ class YfinanceFundamentalAdapter:
             if edgar_override.get("net_income") is not None:
                 net_profit_latest = edgar_override["net_income"]
             result["source_chain"].append("earnings.financial_report:sec-edgar")
+            # Filed YoY: the same 10-Q carries the prior-year quarter as a
+            # framed comparative row. It outranks both the statement rows
+            # (often NaN for the prior year, e.g. BRK.B 2025-09-30) and the
+            # .info ratios (BRK.B net YoY was -27.60% from info vs -28.20%
+            # from the filed comparatives). Missing comparatives keep Yahoo.
+            yoy_overridden = False
+            for field, yoy_key, prev_key in (
+                ("revenue", "revenue_yoy", "prev_revenue"),
+                ("net_income", "net_profit_yoy", "prev_net_income"),
+            ):
+                current = edgar_override.get(field)
+                prev = edgar_override.get(prev_key)
+                if current is not None and prev:
+                    growth_payload[yoy_key] = round((current - prev) / abs(prev) * 100.0, 4)
+                    yoy_overridden = True
+            if yoy_overridden:
+                result["growth"] = growth_payload
+                result["source_chain"].append("growth:sec-edgar")
 
         financial_report = {
             "report_date": report_date,

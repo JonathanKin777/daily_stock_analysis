@@ -414,6 +414,10 @@ def _edgar_facts_fixture() -> dict:
                             entry("10-Q", "2026-09-30", 2026, "Q3", None, 301130000000),
                             entry("10-Q", "2026-09-30", 2026, "Q3", "CY2026Q3", 105647000000),
                             entry("10-Q", "2026-06-30", 2026, "Q2", "CY2026Q2", 117885000000),
+                            # Prior-year quarter as carried by the current
+                            # filing (framed comparative row) + its YTD decoy.
+                            entry("10-Q", "2025-09-30", 2025, "Q3", None, 277212000000),
+                            entry("10-Q", "2025-09-30", 2026, "Q3", "CY2025Q3", 94972000000),
                         ]
                     }
                 },
@@ -422,6 +426,8 @@ def _edgar_facts_fixture() -> dict:
                         "USD": [
                             entry("10-Q", "2026-09-30", 2026, "Q3", None, 57885000000),
                             entry("10-Q", "2026-09-30", 2026, "Q3", "CY2026Q3", 22112000000),
+                            entry("10-Q", "2025-09-30", 2025, "Q3", None, 47769000000),
+                            entry("10-Q", "2025-09-30", 2026, "Q3", "CY2025Q3", 30796000000),
                         ]
                     }
                 },
@@ -452,7 +458,26 @@ class TestSecEdgarQuarterlyFigures(unittest.TestCase):
         figures = fetch_sec_edgar_quarterly_figures(
             "BRK-B", "2026-09-30", _opener=_fake_edgar_opener
         )
-        self.assertEqual(figures, {"revenue": 105647000000.0, "net_income": 22112000000.0})
+        self.assertEqual(
+            figures,
+            {
+                "revenue": 105647000000.0,
+                "net_income": 22112000000.0,
+                # Prior-year quarter carried by the same filing.
+                "prev_revenue": 94972000000.0,
+                "prev_net_income": 30796000000.0,
+            },
+        )
+
+    def test_no_comparative_row_omits_prev_figures(self) -> None:
+        # The 2026-06-30 fixture has no 2025-06-30 comparative row: prev
+        # keys must be absent, not None.
+        figures = fetch_sec_edgar_quarterly_figures(
+            "BRK-B", "2026-06-30", _opener=_fake_edgar_opener
+        )
+        self.assertEqual(figures, {"revenue": 117885000000.0})
+        self.assertNotIn("prev_revenue", figures)
+        self.assertNotIn("prev_net_income", figures)
 
     def test_q4_has_no_standalone_10q(self) -> None:
         calls = []
@@ -487,7 +512,15 @@ class TestSecEdgarQuarterlyFigures(unittest.TestCase):
         figures = fetch_sec_edgar_quarterly_figures(
             "BRK-B", "2026-09-30", _opener=_blocked_tickers_opener
         )
-        self.assertEqual(figures, {"revenue": 105647000000.0, "net_income": 22112000000.0})
+        self.assertEqual(
+            figures,
+            {
+                "revenue": 105647000000.0,
+                "net_income": 22112000000.0,
+                "prev_revenue": 94972000000.0,
+                "prev_net_income": 30796000000.0,
+            },
+        )
 
     def test_unknown_ticker_without_map_returns_none(self) -> None:
         def _blocked_tickers_opener(request, timeout=None):
@@ -528,6 +561,43 @@ class TestSecEdgarBundleOverride(unittest.TestCase):
         self.assertEqual(fr["revenue"], 105647000000.0)
         self.assertEqual(fr["net_profit_parent"], 22112000000.0)
         self.assertIn("earnings.financial_report:sec-edgar", bundle["source_chain"])
+        # Filed YoY from the same filing's comparative rows, not Yahoo info.
+        growth = bundle["growth"]
+        self.assertAlmostEqual(growth["revenue_yoy"], 11.2402, places=4)
+        self.assertAlmostEqual(growth["net_profit_yoy"], -28.1985, places=4)
+        self.assertIn("growth:sec-edgar", bundle["source_chain"])
+
+    def test_bundle_keeps_yahoo_yoy_when_edgar_has_no_comparatives(self) -> None:
+        # EDGAR figures without prior-year rows must not touch the YoY that
+        # Yahoo's info ratios already supplied.
+        info = {
+            "financialCurrency": "USD",
+            "currency": "USD",
+            "currentPrice": 583.34,
+            "revenueGrowth": 0.112,
+            "earningsGrowth": -0.276,
+        }
+        income_df = pd.DataFrame(
+            {
+                pd.Timestamp("2026-09-30"): {"Total Revenue": 1.17593e11, "Net Income": 2.2112e10},
+                pd.Timestamp("2026-06-30"): {"Total Revenue": 1.17885e11, "Net Income": 2.5667e10},
+            }
+        )
+        ticker = _build_mock_ticker(info, income_df)
+        fetcher = lambda symbol, report_date: {
+            "revenue": 105647000000.0,
+            "net_income": 22112000000.0,
+        }
+        with patch("yfinance.Ticker", return_value=ticker):
+            bundle = YfinanceFundamentalAdapter(sec_edgar_fetcher=fetcher).get_fundamental_bundle(
+                "BRK.B"
+            )
+
+        self.assertEqual(bundle["earnings"]["financial_report"]["revenue"], 105647000000.0)
+        growth = bundle["growth"]
+        self.assertEqual(growth["revenue_yoy"], 11.2)
+        self.assertEqual(growth["net_profit_yoy"], -27.6)
+        self.assertNotIn("growth:sec-edgar", bundle["source_chain"])
 
     def test_bundle_without_edgar_keeps_yahoo_values(self) -> None:
         with patch("yfinance.Ticker", return_value=self._brk_b_ticker()):
